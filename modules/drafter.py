@@ -104,14 +104,16 @@ SECTION_SYSTEM = """당신은 IT 제안서 작성 전문가입니다.
 - 참고 문서에 없는 내용은 일반론으로 작성하되, 추측성 수치/이름은 사용 금지"""
 
 
-def generate_outline(slide: dict, requirements: list[dict], strategy: str, ref_text: str = "") -> list[dict]:
+def generate_outline(slide: dict, requirements: list[dict], strategy: str,
+                     ref_text: str = "", overview: str = "") -> list[dict]:
     """소제목 + scope 리스트 반환: [{"title": "...", "scope": "..."}]"""
     req_context = _build_req_context(requirements, slide.get("linked_reqs", []))
     ref_block = f"\n\n[참고 문서]\n{ref_text[:60000]}" if ref_text else ""
+    overview_block = f"[사업 개요]\n{overview}\n\n" if overview else ""
     result = chat(
         [
             {"role": "system", "content": OUTLINE_SYSTEM},
-            {"role": "user", "content": f"[전략 방향]\n{strategy}\n\n[장표] {slide['title']}\n\n[요구사항]\n{req_context}{ref_block}"},
+            {"role": "user", "content": f"{overview_block}[전략 방향]\n{strategy}\n\n[장표] {slide['title']}\n\n[요구사항]\n{req_context}{ref_block}"},
         ],
         model="gpt-4o-mini",
     )
@@ -131,13 +133,17 @@ def generate_outline(slide: dict, requirements: list[dict], strategy: str, ref_t
         return []
 
 
-def _build_section_messages(slide: dict, section_title: str, section_scope: str, requirements: list[dict], strategy: str, ref_text: str = ""):
+def _build_section_messages(slide: dict, section_title: str, section_scope: str,
+                             requirements: list[dict], strategy: str,
+                             ref_text: str = "", overview: str = ""):
     req_context = _build_req_context(requirements, slide.get("linked_reqs", []))
     ref_block = f"\n\n[참고 문서]\n{ref_text[:60000]}" if ref_text else ""
     scope_block = f"\n\n[작성 범위(scope)]\n{section_scope}" if section_scope else ""
+    overview_block = f"[사업 개요]\n{overview}\n\n" if overview else ""
     return [
         {"role": "system", "content": SECTION_SYSTEM},
         {"role": "user", "content": (
+            f"{overview_block}"
             f"[전략 방향]\n{strategy}\n\n"
             f"[장표] {slide['title']}\n\n"
             f"[작성할 소제목] {section_title}"
@@ -148,16 +154,19 @@ def _build_section_messages(slide: dict, section_title: str, section_scope: str,
     ]
 
 
-def generate_section_stream(slide: dict, section_title: str, requirements: list[dict], strategy: str, section_scope: str = "", ref_text: str = ""):
+def generate_section_stream(slide: dict, section_title: str, requirements: list[dict],
+                             strategy: str, section_scope: str = "",
+                             ref_text: str = "", overview: str = ""):
     """단일 소제목 본문 스트리밍 생성. (개별 작성/재작성용)"""
-    messages = _build_section_messages(slide, section_title, section_scope, requirements, strategy, ref_text)
+    messages = _build_section_messages(slide, section_title, section_scope, requirements, strategy, ref_text, overview)
     yield from chat_stream(messages, model="gpt-5.4", max_tokens=2048)
 
 
-def generate_section(slide: dict, section_title: str, section_scope: str, requirements: list[dict], strategy: str, ref_text: str = "") -> str:
+def generate_section(slide: dict, section_title: str, section_scope: str, requirements: list[dict],
+                      strategy: str, ref_text: str = "", overview: str = "") -> str:
     """단일 소제목 본문 일괄 생성 (병렬 호출용, 스트리밍 X)."""
     from .llm import client
-    messages = _build_section_messages(slide, section_title, section_scope, requirements, strategy, ref_text)
+    messages = _build_section_messages(slide, section_title, section_scope, requirements, strategy, ref_text, overview)
     resp = client.chat.completions.create(
         model="gpt-5.4",
         messages=messages,

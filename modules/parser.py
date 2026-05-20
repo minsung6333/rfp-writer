@@ -25,10 +25,43 @@ REQ_PARSE_SYSTEM = """당신은 RFP 문서 분석 전문가입니다.
 
 규칙:
 - 요구사항 ID(SFR-, ECR- 등)가 있으면 그대로 사용, 없으면 TASK-001 형식으로 부여
+- **category는 ID prefix와 문서 내 분류명을 보고 정확하게 부여** (예시의 "기능 요구사항"을 그대로 복사하지 말 것):
+  · ECR-/HWR- → "장비/하드웨어 요구사항"
+  · SFR-/FNR- → "기능 요구사항"
+  · NFR- → "비기능 요구사항"
+  · DAR- → "데이터 요구사항"
+  · SER-/SCR- → "보안 요구사항"
+  · SIR-/IFR- → "인터페이스 요구사항"
+  · PER- → "성능 요구사항"
+  · QUR- → "품질 요구사항"
+  · TER- → "기술 요구사항"
+  · PMR- → "프로젝트관리 요구사항"
+  · PSR- → "프로젝트지원 요구사항"
+  · OTR- → "기타이행 요구사항"
+  · MNT- → "유지관리 요구사항"
+  · 기타 또는 모를 경우 → 문서 내 표기된 분류명 그대로 사용
 - detail은 원문 텍스트를 그대로 추출 (요약하지 않음)
 - 입찰안내, 참가자격, 평가기준, 계약조건, 별지서식은 제외
 - 요구사항이 없는 텍스트면 빈 배열 반환
 - 반드시 위 JSON 형식만 반환"""
+
+PROJECT_OVERVIEW_SYSTEM = """당신은 RFP 문서 분석 전문가입니다.
+주어진 RFP 도입부 텍스트(사업 개요·배경·필요성·목적·목표·범위 등)에서
+사업의 핵심 컨텍스트를 추출해 아래 JSON으로 반환하세요.
+
+{
+  "project_name": "사업명",
+  "background": "추진 배경 (2~4줄)",
+  "necessity": "추진 필요성 (2~4줄)",
+  "purpose": "사업 목적 (2~3줄)",
+  "goals": "주요 목표 (bullet 또는 줄바꿈으로 3~6개)",
+  "scope": "사업 범위 (2~4줄)",
+  "duration_budget": "사업 기간·예산 (확인 가능한 만큼)",
+  "key_points": "기타 제안사가 알아야 할 핵심 정보 (선택, 2~4줄)"
+}
+
+원문에 없는 정보는 빈 문자열로. 추측하지 말 것. 반드시 JSON만 반환."""
+
 
 TOC_FROM_REQS_SYSTEM = """당신은 RFP 제안서 전문가입니다.
 주어진 요구사항 목록을 분석하여 제안사가 작성해야 할 제안서 목차를 설계해주세요.
@@ -76,7 +109,14 @@ REQ_KEYWORDS_STRICT = [
     "요구사항 고유번호", "요구사항 ID", "요구사항ID",
     "SFR-", "DAR-", "SER-", "ECR-", "SIR-", "QUR-",
     "TER-", "PMR-", "PSR-", "PER-", "COR-", "NFR-",
+    "OTR-", "MNT-", "HWR-", "SWR-", "FNR-", "SCR-",
+    "IFR-", "OPR-", "MGR-", "DOC-", "TRN-", "BAR-",
+    "ITR-", "ENR-", "CSR-",
 ]
+
+# 정규식: 임의의 3~4글자 ID prefix + 숫자 (보완용)
+import re as _re_id
+_REQ_ID_PATTERN = _re_id.compile(r'\b[A-Z]{2,4}-\d{2,4}\b')
 
 # 산문형 RFP용 폴백 키워드 (저신뢰 - strict 매칭 없을 때만 사용)
 REQ_KEYWORDS_BROAD = [
@@ -250,10 +290,94 @@ def _is_task_page(text: str) -> bool:
     return bullets >= 6 and len(text) > 300
 
 
+OVERVIEW_KEYWORDS = [
+    "사업 개요", "사업개요", "사업 명", "사업명",
+    "추진 배경", "추진배경", "사업 배경", "사업배경",
+    "추진 필요성", "추진필요성", "필요성",
+    "사업 목적", "사업목적", "추진 목적", "추진목적",
+    "사업 목표", "사업목표", "추진 목표", "추진목표",
+    "사업 범위", "사업범위", "과업 범위", "과업범위",
+    "사업 기간", "사업기간", "사업 예산", "사업예산",
+]
+
+
+def extract_project_overview(pages: list[dict]) -> dict:
+    """RFP 도입부에서 사업 개요 추출. 요구사항 ID 첫 등장 페이지 직전까지 스캔."""
+    # 요구사항 ID 첫 등장 페이지 찾기
+    req_start = None
+    for p in pages:
+        if any(k in p["text"] for k in REQ_KEYWORDS_STRICT) or len(_REQ_ID_PATTERN.findall(p["text"])) >= 2:
+            req_start = p["page"]
+            break
+
+    # 스캔 대상 페이지: 1 ~ (req_start - 1), 최대 20p
+    limit = (req_start - 1) if req_start else 20
+    limit = min(limit, 20)
+    candidate_pages = [p for p in pages if p["page"] <= limit]
+
+    # 키워드 있는 페이지 우선, 없으면 전부
+    keyword_pages = [p for p in candidate_pages if any(k in p["text"] for k in OVERVIEW_KEYWORDS)]
+    target_pages = keyword_pages or candidate_pages
+
+    if not target_pages:
+        return {}
+
+    text = "\n\n---PAGE---\n\n".join(
+        f"[p{p['page']}]\n{p['text']}" for p in target_pages
+    )
+    # 너무 길면 잘라서 (40K자 한도)
+    if len(text) > 40000:
+        text = text[:40000]
+
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": PROJECT_OVERVIEW_SYSTEM},
+                {"role": "user", "content": text},
+            ],
+            temperature=0,
+            response_format={"type": "json_object"},
+            timeout=60,
+        )
+        return json.loads(resp.choices[0].message.content or "{}")
+    except Exception as e:
+        print(f"사업 개요 추출 실패: {e}")
+        return {}
+
+
+def format_overview_text(overview: dict) -> str:
+    """LLM 컨텍스트용으로 사업 개요를 텍스트로 포매팅."""
+    if not overview:
+        return ""
+    parts = []
+    labels = {
+        "project_name": "사업명",
+        "background": "추진 배경",
+        "necessity": "추진 필요성",
+        "purpose": "사업 목적",
+        "goals": "주요 목표",
+        "scope": "사업 범위",
+        "duration_budget": "사업 기간·예산",
+        "key_points": "핵심 정보",
+    }
+    for key, label in labels.items():
+        v = overview.get(key, "").strip()
+        if v:
+            parts.append(f"**{label}**\n{v}")
+    return "\n\n".join(parts)
+
+
 def find_requirement_pages(pages: list[dict]) -> tuple[str, bool]:
     """요구사항 관련 페이지 텍스트 반환. fallback 여부도 함께 반환."""
-    # 1단계: 표준 ID 체계 페이지 (고신뢰)
-    strict_pages = [p for p in pages if any(k in p["text"] for k in REQ_KEYWORDS_STRICT)]
+    # 1단계: 표준 ID 체계 페이지 (키워드 + 정규식 패턴 보완)
+    def _has_req_id(text: str) -> bool:
+        if any(k in text for k in REQ_KEYWORDS_STRICT):
+            return True
+        # 정규식: PREFIX-NNN 패턴이 2회 이상 나타나면 요구사항 페이지로 간주
+        return len(_REQ_ID_PATTERN.findall(text)) >= 2
+
+    strict_pages = [p for p in pages if _has_req_id(p["text"])]
     if strict_pages:
         text = "\n\n---PAGE---\n\n".join(p["text"] for p in strict_pages)
         return text, False

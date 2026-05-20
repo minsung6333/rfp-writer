@@ -28,6 +28,7 @@ STATUS_ICON = {"미작성": "⬜", "질문중": "💬", "초안완료": "📝", 
 for key, default in [
     ("requirements", []),
     ("slides", []),
+    ("project_overview", {}),
     ("selected_slide_id", None),
     ("qa_buffers", {}),
     ("debate", {
@@ -90,7 +91,7 @@ with st.sidebar:
                 from modules.parser import (
                     extract_text_by_page, find_requirement_pages, find_toc_pages,
                     split_req_chunks, parse_chunk, parse_toc_with_llm,
-                    generate_toc_from_requirements,
+                    generate_toc_from_requirements, extract_project_overview,
                 )
                 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -141,8 +142,15 @@ with st.sidebar:
                 slides = build_slides_from_toc(toc, all_requirements)
                 st.write(f"✅ 장표 {len(slides)}개 생성 완료")
 
+                st.write("📋 사업 개요 추출 중...")
+                overview = extract_project_overview(pages)
+                if overview:
+                    pname = overview.get("project_name", "(미상)")
+                    st.write(f"✅ 사업 개요 추출: {pname}")
+
                 st.session_state.requirements = all_requirements
                 st.session_state.slides = slides
+                st.session_state.project_overview = overview
                 st.session_state.selected_slide_id = None
                 st.session_state.qa_buffers = {}
                 status.update(label="파싱 완료!", state="complete")
@@ -196,11 +204,29 @@ with st.sidebar:
                 else:
                     st.warning("장표 목차 시트가 없습니다. 요구사항만 로드됩니다.")
 
+                # 사업 개요 시트가 있으면 로드
+                loaded_overview = {}
+                if "사업 개요" in xl.sheet_names:
+                    df_ov = pd.read_excel(xl, sheet_name="사업 개요", dtype=str).fillna("")
+                    label_to_key = {
+                        "사업명": "project_name", "추진 배경": "background",
+                        "추진 필요성": "necessity", "사업 목적": "purpose",
+                        "주요 목표": "goals", "사업 범위": "scope",
+                        "기간·예산": "duration_budget", "핵심 정보": "key_points",
+                    }
+                    for _, row in df_ov.iterrows():
+                        label = str(row.get("항목", "")).strip()
+                        content = str(row.get("내용", "")).strip()
+                        if label in label_to_key and content:
+                            loaded_overview[label_to_key[label]] = content
+
                 st.session_state.requirements = loaded_reqs
                 st.session_state.slides = loaded_slides
+                st.session_state.project_overview = loaded_overview
                 st.session_state.selected_slide_id = None
                 st.session_state.qa_buffers = {}
-                st.success(f"✅ 요구사항 {len(loaded_reqs)}개, 장표 {len(loaded_slides)}개 로드 완료")
+                ov_msg = f", 사업 개요 ✓" if loaded_overview else ""
+                st.success(f"✅ 요구사항 {len(loaded_reqs)}개, 장표 {len(loaded_slides)}개{ov_msg} 로드 완료")
                 st.rerun()
             except Exception as e:
                 st.error(f"엑셀 로드 오류: {e}")
@@ -216,6 +242,7 @@ with st.sidebar:
                 "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
                 "requirements": st.session_state.get("requirements", []),
                 "slides": st.session_state.get("slides", []),
+                "project_overview": st.session_state.get("project_overview", {}),
                 "debate": st.session_state.get("debate", {}),
                 "qa_buffers": st.session_state.get("qa_buffers", {}),
                 "selected_slide_id": st.session_state.get("selected_slide_id"),
@@ -245,7 +272,7 @@ with st.sidebar:
         if uploaded_session and st.button("📂 불러오기", use_container_width=True, type="primary"):
             try:
                 data = json.loads(uploaded_session.read().decode("utf-8"))
-                for k in ["requirements", "slides", "debate", "qa_buffers", "selected_slide_id"]:
+                for k in ["requirements", "slides", "project_overview", "debate", "qa_buffers", "selected_slide_id"]:
                     if k in data:
                         st.session_state[k] = data[k]
                 st.success(f"✅ 복원 완료 (저장 시각: {data.get('saved_at', '-')})")
@@ -254,6 +281,34 @@ with st.sidebar:
                 st.error(f"복원 실패: {e}")
 
     st.divider()
+
+    # 사업 개요
+    if st.session_state.get("project_overview"):
+        from modules.parser import format_overview_text
+        ov = st.session_state.project_overview
+        pname = ov.get("project_name", "사업 개요")
+        with st.expander(f"📋 {pname[:30]}", expanded=False):
+            labels = {
+                "project_name": "사업명",
+                "background": "추진 배경",
+                "necessity": "추진 필요성",
+                "purpose": "사업 목적",
+                "goals": "주요 목표",
+                "scope": "사업 범위",
+                "duration_budget": "기간·예산",
+                "key_points": "핵심 정보",
+            }
+            for key, label in labels.items():
+                cur = ov.get(key, "")
+                new_v = st.text_area(
+                    label, value=cur, height=70 if key != "goals" else 100,
+                    key=f"overview_{key}",
+                )
+                if new_v != cur:
+                    st.session_state.project_overview[key] = new_v
+            st.caption("편집 가능 — LLM 호출 시 컨텍스트로 자동 전달됩니다.")
+
+        st.divider()
 
     # 진행 현황
     if st.session_state.slides:
@@ -270,7 +325,7 @@ with st.sidebar:
 
 
 # ── 엑셀 내보내기 ──────────────────────────────────────────
-def build_excel(requirements: list[dict], slides: list[dict]) -> bytes:
+def build_excel(requirements: list[dict], slides: list[dict], overview: dict = None) -> bytes:
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Font, PatternFill, Alignment
@@ -280,9 +335,39 @@ def build_excel(requirements: list[dict], slides: list[dict]) -> bytes:
 
     wb = Workbook()
 
-    # 요구사항 시트
-    ws_req = wb.active
-    ws_req.title = "요구사항"
+    # 사업 개요 시트 (있을 때만, 첫 시트로)
+    if overview:
+        ws_ov = wb.active
+        ws_ov.title = "사업 개요"
+        labels = [
+            ("project_name", "사업명"),
+            ("background", "추진 배경"),
+            ("necessity", "추진 필요성"),
+            ("purpose", "사업 목적"),
+            ("goals", "주요 목표"),
+            ("scope", "사업 범위"),
+            ("duration_budget", "기간·예산"),
+            ("key_points", "핵심 정보"),
+        ]
+        # 헤더
+        for col, h in enumerate(["항목", "내용"], 1):
+            cell = ws_ov.cell(row=1, column=col, value=h)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", start_color="C65911")
+            cell.alignment = Alignment(horizontal="center")
+        for row, (key, label) in enumerate(labels, 2):
+            ws_ov.cell(row=row, column=1, value=label).font = Font(bold=True)
+            cell = ws_ov.cell(row=row, column=2, value=overview.get(key, ""))
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+        ws_ov.column_dimensions["A"].width = 18
+        ws_ov.column_dimensions["B"].width = 80
+        for r in range(2, len(labels) + 2):
+            ws_ov.row_dimensions[r].height = 60
+
+        ws_req = wb.create_sheet("요구사항")
+    else:
+        ws_req = wb.active
+        ws_req.title = "요구사항"
     headers_req = ["ID", "카테고리", "명칭", "정의", "세부내용"]
     for col, h in enumerate(headers_req, 1):
         cell = ws_req.cell(row=1, column=col, value=h)
@@ -371,7 +456,7 @@ with tab_reqs:
     st.progress(pct / 100)
 
     # 엑셀 다운로드
-    excel_bytes = build_excel(reqs, slides)
+    excel_bytes = build_excel(reqs, slides, st.session_state.get("project_overview"))
     if excel_bytes:
         st.download_button(
             "⬇️ 엑셀로 내보내기 (요구사항+목차)",
@@ -589,7 +674,7 @@ with tab_toc:
             st.success("재매핑 완료")
             st.rerun()
     with col_dl:
-        excel_bytes2 = build_excel(st.session_state.requirements, st.session_state.slides)
+        excel_bytes2 = build_excel(st.session_state.requirements, st.session_state.slides, st.session_state.get("project_overview"))
         if excel_bytes2:
             st.download_button(
                 "⬇️ 엑셀 (요구사항+목차)",
@@ -609,6 +694,8 @@ with tab_strategy:
     from modules.parser import extract_text_by_page
 
     debate = st.session_state.debate
+    from modules.parser import format_overview_text
+    overview_text = format_overview_text(st.session_state.get("project_overview", {}))
     chapters = sorted(set(s.get("chapter", "") for s in st.session_state.slides if s.get("chapter")))
 
     col_setup, col_debate = st.columns([1, 2])
@@ -789,7 +876,7 @@ with tab_strategy:
             elif status == "strategist":
                 with st.chat_message("assistant", avatar="🎯"):
                     st.caption(f"전략가 · 라운드 {debate['round']}")
-                    response = st.write_stream(stream_strategist(context, debate["history"], ref_text))
+                    response = st.write_stream(stream_strategist(context, debate["history"], ref_text, overview_text))
                 clean, need_info, need_doc = parse_agent_response(response)
                 debate["history"].append({"agent": "strategist", "label": f"라운드 {debate['round']}", "content": clean})
                 if need_doc:
@@ -807,7 +894,7 @@ with tab_strategy:
             elif status == "critic":
                 with st.chat_message("assistant", avatar="⚔️"):
                     st.caption(f"비평가 · 라운드 {debate['round']}")
-                    response = st.write_stream(stream_critic(context, debate["history"], ref_text))
+                    response = st.write_stream(stream_critic(context, debate["history"], ref_text, overview_text))
                 clean, need_info, need_doc = parse_agent_response(response)
                 debate["history"].append({"agent": "critic", "label": f"라운드 {debate['round']}", "content": clean})
                 if need_doc:
@@ -976,7 +1063,7 @@ with tab_strategy:
 
             elif status == "summarizing":
                 with st.spinner("최종 전략 정리 중..."):
-                    final = run_summarizer(context, debate["history"])
+                    final = run_summarizer(context, debate["history"], overview_text)
                 debate["final_strategy"] = final
                 debate["history"].append({"agent": "final", "label": "최종", "content": final})
                 debate["status"] = "checking_docs"
@@ -984,7 +1071,7 @@ with tab_strategy:
 
             elif status == "checking_docs":
                 with st.spinner("장표 작성에 필요한 참고문서 확인 중..."):
-                    needed = check_needed_docs(context, debate["final_strategy"], ref_text)
+                    needed = check_needed_docs(context, debate["final_strategy"], ref_text, overview_text)
                 if needed:
                     doc_list_text = "**장표 작성을 위해 다음 문서가 필요합니다:**\n\n" + "\n".join(
                         f"- **{d.get('name','')}**: {d.get('reason','')}" for d in needed
@@ -1028,7 +1115,7 @@ with tab_strategy:
                             btn_label = "목차 재생성" if outline else "목차 생성"
                             if st.button(btn_label, key=f"outline_{s_key}", use_container_width=True):
                                 with st.spinner("목차 생성 중..."):
-                                    slide["outline"] = generate_outline(slide, slide_reqs, strategy_hint, ref_text)
+                                    slide["outline"] = generate_outline(slide, slide_reqs, strategy_hint, ref_text, overview_text)
                                     slide.setdefault("sections", {})
                                 st.rerun()
 
@@ -1055,7 +1142,7 @@ with tab_strategy:
                                     def _run(o):
                                         return o["title"], generate_section(
                                             slide, o["title"], o.get("scope", ""),
-                                            slide_reqs, strategy_hint, ref_text,
+                                            slide_reqs, strategy_hint, ref_text, overview_text,
                                         )
                                     with st.spinner(f"{len(missing)}개 병렬 생성 중..."):
                                         with ThreadPoolExecutor(max_workers=min(len(missing), 4)) as ex:
@@ -1091,7 +1178,7 @@ with tab_strategy:
                                     if st.button(btn_label, key=f"sec_btn_{s_key}_{sec_title}", use_container_width=True):
                                         with st.spinner(f"'{sec_title}' 작성 중..."):
                                             content = st.write_stream(
-                                                generate_section_stream(slide, sec_title, slide_reqs, strategy_hint, sec_scope, ref_text)
+                                                generate_section_stream(slide, sec_title, slide_reqs, strategy_hint, sec_scope, ref_text, overview_text)
                                             )
                                         slide.setdefault("sections", {})[sec_title] = content
                                         st.session_state[edit_key] = content
@@ -1162,13 +1249,21 @@ with tab_strategy:
                         f"# {ch}장 — 제안서 초안 패키지\n",
                         "> 이 문서는 RFP 분석 → 전략 토론 → 참고문서 반영 → 장표별 초안 작성 전체 컨텍스트를 담고 있습니다.\n",
                         "---\n",
+                    ]
+                    if overview_text:
+                        md_lines.extend([
+                            "## 🏢 사업 개요\n",
+                            overview_text,
+                            "\n---\n",
+                        ])
+                    md_lines.extend([
                         "## 📑 챕터 구성 및 요구사항\n",
                         "```\n" + context + "\n```\n",
                         "---\n",
                         "## 📋 최종 전략\n",
                         debate["final_strategy"],
                         "\n---\n",
-                    ]
+                    ])
 
                     # 전략 논의 history
                     hist_items = [h for h in debate["history"] if h["agent"] not in ("final",)]

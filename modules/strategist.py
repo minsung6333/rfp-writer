@@ -129,8 +129,11 @@ def parse_agent_response(text: str) -> tuple[str, str, str]:
     return text.strip(), "", ""
 
 
-def _build_messages(context: str, history: list[dict], ref_text: str = "") -> list[dict]:
+def _build_messages(context: str, history: list[dict], ref_text: str = "", overview: str = "") -> list[dict]:
     messages = []
+    if overview:
+        messages.append({"role": "user", "content": f"[사업 개요]\n{overview}"})
+        messages.append({"role": "assistant", "content": "사업 개요 확인했습니다."})
     if ref_text:
         messages.append({"role": "user", "content": f"[참고 문서]\n{ref_text}"})
         messages.append({"role": "assistant", "content": "참고 문서 확인했습니다."})
@@ -141,8 +144,8 @@ def _build_messages(context: str, history: list[dict], ref_text: str = "") -> li
     return messages
 
 
-def stream_strategist(context: str, history: list[dict], ref_text: str = ""):
-    msgs = _build_messages(context, history, ref_text)
+def stream_strategist(context: str, history: list[dict], ref_text: str = "", overview: str = ""):
+    msgs = _build_messages(context, history, ref_text, overview)
     if not history:
         msgs.append({"role": "user", "content": "위 챕터에 대한 제안서 작성 전략을 제시해주세요."})
     else:
@@ -160,8 +163,8 @@ def stream_strategist(context: str, history: list[dict], ref_text: str = ""):
             yield delta
 
 
-def stream_critic(context: str, history: list[dict], ref_text: str = ""):
-    msgs = _build_messages(context, history, ref_text)
+def stream_critic(context: str, history: list[dict], ref_text: str = "", overview: str = ""):
+    msgs = _build_messages(context, history, ref_text, overview)
     msgs.append({"role": "user", "content": "위 전략의 약점을 비평하고 개선 방향을 제시해주세요."})
     resp = client.chat.completions.create(
         model="gpt-5.4",
@@ -187,13 +190,16 @@ REVISE_STRATEGY_SYSTEM = """당신은 RFP 제안서 전략 전문가입니다.
 - 추가 설명/머리말 없이 갱신된 전략 본문만 출력"""
 
 
-def revise_final_strategy(context: str, final_strategy: str, user_addition: str, ref_text: str = "") -> str:
+def revise_final_strategy(context: str, final_strategy: str, user_addition: str,
+                          ref_text: str = "", overview: str = "") -> str:
     ref_note = f"\n\n[참고 문서]\n{ref_text[:60000]}" if ref_text else ""
+    overview_note = f"[사업 개요]\n{overview}\n\n" if overview else ""
     resp = client.chat.completions.create(
         model="gpt-5.4",
         messages=[
             {"role": "system", "content": REVISE_STRATEGY_SYSTEM},
             {"role": "user", "content": (
+                f"{overview_note}"
                 f"{context}\n\n"
                 f"[기존 최종 전략]\n{final_strategy}\n\n"
                 f"[유저 의견]\n{user_addition}"
@@ -205,15 +211,16 @@ def revise_final_strategy(context: str, final_strategy: str, user_addition: str,
     return resp.choices[0].message.content
 
 
-def check_needed_docs(context: str, final_strategy: str, ref_text: str = "") -> list[dict]:
+def check_needed_docs(context: str, final_strategy: str, ref_text: str = "", overview: str = "") -> list[dict]:
     """장표 작성에 필요한 추가 문서 목록 반환. 없으면 빈 리스트."""
     ref_note = f"\n\n[이미 첨부된 문서 요약]\n{ref_text[:60000]}" if ref_text else "\n\n[이미 첨부된 문서] 없음"
+    overview_note = f"[사업 개요]\n{overview}\n\n" if overview else ""
     try:
         resp = client.chat.completions.create(
             model="gpt-5.4",
             messages=[
                 {"role": "system", "content": NEEDED_DOCS_SYSTEM},
-                {"role": "user", "content": f"{context}\n\n[최종 전략]\n{final_strategy}{ref_note}"},
+                {"role": "user", "content": f"{overview_note}{context}\n\n[최종 전략]\n{final_strategy}{ref_note}"},
             ],
             response_format={"type": "json_object"},
             timeout=60,
@@ -223,15 +230,16 @@ def check_needed_docs(context: str, final_strategy: str, ref_text: str = "") -> 
         return []
 
 
-def run_summarizer(context: str, history: list[dict]) -> str:
+def run_summarizer(context: str, history: list[dict], overview: str = "") -> str:
     debate_text = "\n\n".join(
         f"[{h['label']}]\n{h['content']}" for h in history
     )
+    overview_note = f"[사업 개요]\n{overview}\n\n" if overview else ""
     resp = client.chat.completions.create(
         model="gpt-4o",
         messages=[
             {"role": "system", "content": SUMMARIZER_SYSTEM},
-            {"role": "user", "content": f"{context}\n\n---\n\n{debate_text}"},
+            {"role": "user", "content": f"{overview_note}{context}\n\n---\n\n{debate_text}"},
         ],
         temperature=0.5,
         timeout=120,
