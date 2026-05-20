@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import os, json, tempfile, io
+import os, json, tempfile, io, datetime
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -28,7 +28,6 @@ STATUS_ICON = {"미작성": "⬜", "질문중": "💬", "초안완료": "📝", 
 for key, default in [
     ("requirements", []),
     ("slides", []),
-    ("strategy", ""),
     ("selected_slide_id", None),
     ("qa_buffers", {}),
     ("debate", {
@@ -79,7 +78,7 @@ with st.sidebar:
 
     # 입력 방식 탭
     st.subheader("1. 데이터 입력")
-    tab_pdf, tab_xl = st.tabs(["📄 PDF 파싱", "📥 엑셀 로드"])
+    tab_pdf, tab_xl, tab_session = st.tabs(["📄 PDF 파싱", "📥 엑셀 로드", "💾 세션"])
 
     with tab_pdf:
         uploaded = st.file_uploader("PDF 파일", type=["pdf"], label_visibility="collapsed")
@@ -206,19 +205,53 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"엑셀 로드 오류: {e}")
 
-    st.divider()
+    with tab_session:
+        st.caption("작업 중인 프로젝트를 JSON 파일로 저장/복원합니다. (전략·토론·VLLM 결과·장표 초안 전체 포함)")
 
-    # 전략 문서
-    st.subheader("2. 전략 방향")
-    strategy = st.text_area(
-        "전략",
-        value=st.session_state.strategy,
-        height=160,
-        placeholder="예) 온프레미스 LLM 기반, 보안 강조, RAG 차별화...",
-        label_visibility="collapsed",
-    )
-    if strategy != st.session_state.strategy:
-        st.session_state.strategy = strategy
+        # 저장
+        has_work = bool(st.session_state.get("requirements") or st.session_state.get("slides"))
+        if has_work:
+            session_data = {
+                "version": "v2",
+                "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                "requirements": st.session_state.get("requirements", []),
+                "slides": st.session_state.get("slides", []),
+                "debate": st.session_state.get("debate", {}),
+                "qa_buffers": st.session_state.get("qa_buffers", {}),
+                "selected_slide_id": st.session_state.get("selected_slide_id"),
+            }
+            try:
+                session_json = json.dumps(session_data, ensure_ascii=False, indent=2)
+                fname = f"rfp_session_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                st.download_button(
+                    "💾 프로젝트 저장",
+                    data=session_json.encode("utf-8"),
+                    file_name=fname,
+                    mime="application/json",
+                    use_container_width=True,
+                )
+                st.caption(f"크기: {len(session_json):,}자")
+            except Exception as e:
+                st.error(f"저장 직렬화 실패: {e}")
+        else:
+            st.info("저장할 작업이 없습니다. PDF 파싱 또는 엑셀 로드를 먼저 진행하세요.")
+
+        st.divider()
+
+        # 복원
+        uploaded_session = st.file_uploader(
+            "세션 JSON 파일", type=["json"], key="session_upload", label_visibility="collapsed",
+        )
+        if uploaded_session and st.button("📂 불러오기", use_container_width=True, type="primary"):
+            try:
+                data = json.loads(uploaded_session.read().decode("utf-8"))
+                for k in ["requirements", "slides", "debate", "qa_buffers", "selected_slide_id"]:
+                    if k in data:
+                        st.session_state[k] = data[k]
+                st.success(f"✅ 복원 완료 (저장 시각: {data.get('saved_at', '-')})")
+                st.rerun()
+            except Exception as e:
+                st.error(f"복원 실패: {e}")
 
     st.divider()
 
@@ -230,14 +263,10 @@ with st.sidebar:
         st.progress(done / total if total else 0)
         st.caption(f"완료 {done} / 초안 {drafted} / 전체 {total}")
 
-        # 미커버 요구사항
+        # 미커버 요구사항 (카운트만, 자세한건 탭에서)
         uncovered = get_uncovered_reqs(st.session_state.requirements, st.session_state.slides)
         if uncovered:
-            with st.expander(f"⚠️ 미커버 요구사항 {len(uncovered)}개"):
-                for uid in uncovered:
-                    r = get_req(uid)
-                    name = r["name"] if r else ""
-                    st.caption(f"{uid} {name}")
+            st.caption(f"⚠️ 미커버 {len(uncovered)}개 → **요구사항 목록** 탭에서 확인")
 
 
 # ── 엑셀 내보내기 ──────────────────────────────────────────
@@ -293,6 +322,18 @@ def build_excel(requirements: list[dict], slides: list[dict]) -> bytes:
     return buf.getvalue()
 
 
+def _vllm_with_progress(fn, label: str = "VLLM 처리"):
+    """fn(progress_callback) → result, with st.progress bar."""
+    bar = st.progress(0.0, text=f"{label} 준비 중...")
+    def cb(done: int, total: int):
+        if total > 0:
+            bar.progress(min(done / total, 1.0), text=f"{label} {done}/{total} 배치 완료")
+    try:
+        return fn(cb)
+    finally:
+        bar.empty()
+
+
 # ── 메인 화면 ──────────────────────────────────────────────
 if not st.session_state.slides:
     st.info("👈 사이드바에서 RFP PDF를 업로드하세요.")
@@ -302,27 +343,113 @@ if not st.session_state.slides:
 tab_strategy, tab_reqs, tab_toc = st.tabs(["🎯 전략 수립", "📊 요구사항 목록", "🗂️ 목차 구성"])
 
 with tab_reqs:
-    st.caption(f"총 {len(st.session_state.requirements)}개 요구사항")
-    excel_bytes = build_excel(st.session_state.requirements, st.session_state.slides)
+    import pandas as pd
+    reqs = st.session_state.requirements
+    slides = st.session_state.slides
+
+    # 역매핑: req_id → [slide titles]
+    req_to_slides = {}
+    for s in slides:
+        for rid in s.get("linked_reqs", []):
+            req_to_slides.setdefault(rid, []).append(
+                f"{s.get('chapter','')}-{s.get('section','')} {s.get('title','')}"
+            )
+    covered_ids = set(req_to_slides.keys())
+    uncovered_reqs = [r for r in reqs if r["id"] not in covered_ids]
+
+    # ── 커버리지 요약 ──
+    col_total, col_cov, col_uncov, col_pct = st.columns(4)
+    total = len(reqs)
+    n_cov = total - len(uncovered_reqs)
+    pct = (n_cov / total * 100) if total else 0
+    col_total.metric("전체 요구사항", total)
+    col_cov.metric("커버됨", n_cov)
+    col_uncov.metric("미커버", len(uncovered_reqs),
+                     delta=f"-{len(uncovered_reqs)}" if uncovered_reqs else None,
+                     delta_color="inverse")
+    col_pct.metric("커버리지", f"{pct:.1f}%")
+    st.progress(pct / 100)
+
+    # 엑셀 다운로드
+    excel_bytes = build_excel(reqs, slides)
     if excel_bytes:
         st.download_button(
-            "⬇️ 엑셀로 내보내기",
+            "⬇️ 엑셀로 내보내기 (요구사항+목차)",
             data=excel_bytes,
             file_name="rfp_파싱결과.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-    import pandas as pd
+
+    st.divider()
+
+    # ── 카테고리별 커버리지 ──
+    cat_stats = {}
+    for r in reqs:
+        cat = r.get("category", "(미분류)")
+        cat_stats.setdefault(cat, {"total": 0, "covered": 0})
+        cat_stats[cat]["total"] += 1
+        if r["id"] in covered_ids:
+            cat_stats[cat]["covered"] += 1
+    cat_rows = [
+        {
+            "카테고리": cat,
+            "전체": v["total"],
+            "커버": v["covered"],
+            "미커버": v["total"] - v["covered"],
+            "커버리지": f"{v['covered']/v['total']*100:.0f}%" if v["total"] else "-",
+        }
+        for cat, v in sorted(cat_stats.items(), key=lambda x: -(x[1]["total"] - x[1]["covered"]))
+    ]
+    with st.expander("📊 카테고리별 커버리지", expanded=True):
+        st.dataframe(cat_rows, use_container_width=True, hide_index=True)
+
+    # ── 미커버 요구사항 (상세) ──
+    if uncovered_reqs:
+        with st.expander(f"⚠️ 미커버 요구사항 상세 ({len(uncovered_reqs)}개) — 평가 감점 위험", expanded=True):
+            st.caption("아래 요구사항들은 어떤 장표에도 매핑되어 있지 않습니다. 목차 구성 탭에서 매핑을 추가하거나, 자동 재매핑을 실행하세요.")
+            uncov_rows = [
+                {
+                    "ID": r.get("id", ""),
+                    "카테고리": r.get("category", ""),
+                    "명칭": r.get("name", ""),
+                    "정의": r.get("definition", "") or (r.get("detail", "")[:80] + "...") if r.get("detail") else "",
+                }
+                for r in uncovered_reqs
+            ]
+            st.dataframe(uncov_rows, use_container_width=True, hide_index=True, height=min(400, 40 + 35 * len(uncov_rows)))
+
+            if st.button("🔄 미커버 요구사항 자동 매핑 시도", use_container_width=True):
+                with st.spinner("LLM이 미커버 요구사항을 적절한 장표에 매핑 중..."):
+                    titles = [s.get("title", "") for s in slides]
+                    # 모든 슬라이드에 대해 전체 재매핑 (단순화)
+                    mapping = bulk_link_reqs(titles, reqs)
+                    for s in slides:
+                        new_links = mapping.get(s.get("title", ""), [])
+                        # 기존 매핑 + 새로 추가된 것만 (덮어쓰지 않음)
+                        existing = set(s.get("linked_reqs", []))
+                        added = [r for r in new_links if r not in existing]
+                        s["linked_reqs"] = list(existing) + added
+                st.success("✅ 재매핑 완료")
+                st.rerun()
+    else:
+        st.success(f"✅ 모든 요구사항({total}개)이 장표에 매핑되어 있습니다.")
+
+    st.divider()
+
+    # ── 전체 요구사항 표 (연결 장표 컬럼 추가) ──
+    st.markdown("**전체 요구사항**")
     req_rows = [
         {
             "ID": r.get("id", ""),
             "카테고리": r.get("category", ""),
             "명칭": r.get("name", ""),
             "정의": r.get("definition", ""),
+            "연결 장표": " | ".join(req_to_slides.get(r["id"], [])) or "❌ 미매핑",
             "세부내용": r.get("detail", ""),
         }
-        for r in st.session_state.requirements
+        for r in reqs
     ]
-    st.dataframe(req_rows, use_container_width=True, height=600)
+    st.dataframe(req_rows, use_container_width=True, height=500, hide_index=True)
 
 with tab_toc:
     st.caption(f"총 {len(st.session_state.slides)}개 장표 — 표를 직접 편집하거나 VLLM으로 목차를 재추출할 수 있습니다.")
@@ -357,8 +484,10 @@ with tab_toc:
                 tmp.write(toc_v_pdf.read())
                 tmp_path = tmp.name
             pages_sel = parse_page_range(toc_v_pages)
-            with st.spinner(f"{len(pages_sel)}페이지 VLLM 목차 추출 중..."):
-                new_slides_raw = extract_toc_with_vision(tmp_path, pages_sel)
+            new_slides_raw = _vllm_with_progress(
+                lambda cb: extract_toc_with_vision(tmp_path, pages_sel, progress_callback=cb),
+                label=f"VLLM 목차 추출 ({len(pages_sel)}p)",
+            )
             os.remove(tmp_path)
             if not new_slides_raw:
                 st.error("목차를 추출하지 못했습니다. 페이지 번호와 PDF 내용을 확인해주세요.")
@@ -628,8 +757,10 @@ with tab_strategy:
                             tmp_path = tmp.name
                         pages_sel = parse_page_range(init_pages) if init_pages.strip() else []
                         if pages_sel:
-                            with st.spinner(f"{len(pages_sel)}페이지 VLLM 파싱 중..."):
-                                doc_text = parse_pages_with_vision(tmp_path, pages_sel)
+                            doc_text = _vllm_with_progress(
+                                lambda cb: parse_pages_with_vision(tmp_path, pages_sel, progress_callback=cb),
+                                label=f"VLLM 파싱 ({len(pages_sel)}p)",
+                            )
                             label_suffix = f"VLLM p.{','.join(map(str, pages_sel))}"
                         else:
                             with st.spinner("문서 파싱 중..."):
@@ -763,8 +894,10 @@ with tab_strategy:
                             tmp_path = tmp.name
                         pages_sel = parse_page_range(wd_pages) if wd_pages.strip() else []
                         if pages_sel:
-                            with st.spinner(f"{len(pages_sel)}페이지 VLLM 파싱 중..."):
-                                doc_text = parse_pages_with_vision(tmp_path, pages_sel)
+                            doc_text = _vllm_with_progress(
+                                lambda cb: parse_pages_with_vision(tmp_path, pages_sel, progress_callback=cb),
+                                label=f"VLLM 파싱 ({len(pages_sel)}p)",
+                            )
                             label_suffix = f"VLLM p.{','.join(map(str, pages_sel))}"
                         else:
                             with st.spinner("문서 파싱 중..."):
@@ -812,8 +945,10 @@ with tab_strategy:
                             tmp_path = tmp.name
                         pages = parse_page_range(ur_pages) if ur_pages.strip() else []
                         if pages:
-                            with st.spinner(f"{len(pages)}페이지 VLLM 파싱 중..."):
-                                doc_text = parse_pages_with_vision(tmp_path, pages)
+                            doc_text = _vllm_with_progress(
+                                lambda cb: parse_pages_with_vision(tmp_path, pages, progress_callback=cb),
+                                label=f"VLLM 파싱 ({len(pages)}p)",
+                            )
                             label_suffix = f"VLLM p.{','.join(map(str, pages))}"
                         else:
                             with st.spinner("문서 파싱 중..."):
@@ -928,6 +1063,8 @@ with tab_strategy:
                                     slide.setdefault("sections", {})
                                     for t, content in results:
                                         slide["sections"][t] = content
+                                        # 편집 위젯 값도 동기화
+                                        st.session_state[f"sec_edit_{s_key}_{t}"] = content
                                     slide["draft"] = "\n\n".join(
                                         f"### {t}\n{slide['sections'][t]}" for t in titles
                                         if t in slide["sections"]
@@ -939,31 +1076,64 @@ with tab_strategy:
                             for o in outline:
                                 sec_title = o["title"]
                                 sec_scope = o.get("scope", "")
-                                col_sec, col_write = st.columns([3, 1])
-                                with col_sec:
-                                    if sec_title in sections:
-                                        st.markdown(f"**{sec_title}**")
-                                        if sec_scope:
-                                            st.caption(f"📐 scope: {sec_scope}")
-                                        st.markdown(sections[sec_title])
-                                    else:
-                                        st.markdown(f"**{sec_title}** *(미작성)*")
-                                        if sec_scope:
-                                            st.caption(f"📐 scope: {sec_scope}")
-                                with col_write:
-                                    btn_label = "재작성" if sec_title in sections else "작성"
-                                    if st.button(btn_label, key=f"sec_{s_key}_{sec_title}", use_container_width=True):
+                                has_content = sec_title in sections
+                                edit_key = f"sec_edit_{s_key}_{sec_title}"
+
+                                # 헤더 + 액션 버튼
+                                col_h, col_btn1, col_btn2 = st.columns([4, 1, 1])
+                                with col_h:
+                                    icon = "✏️" if has_content else "⬜"
+                                    st.markdown(f"{icon} **{sec_title}**")
+                                    if sec_scope:
+                                        st.caption(f"📐 scope: {sec_scope}")
+                                with col_btn1:
+                                    btn_label = "재생성" if has_content else "AI 작성"
+                                    if st.button(btn_label, key=f"sec_btn_{s_key}_{sec_title}", use_container_width=True):
                                         with st.spinner(f"'{sec_title}' 작성 중..."):
                                             content = st.write_stream(
                                                 generate_section_stream(slide, sec_title, slide_reqs, strategy_hint, sec_scope, ref_text)
                                             )
                                         slide.setdefault("sections", {})[sec_title] = content
-                                        if all(t in slide["sections"] for t in titles):
+                                        st.session_state[edit_key] = content
+                                        if all(t in slide.get("sections", {}) for t in titles):
                                             slide["draft"] = "\n\n".join(
                                                 f"### {t}\n{slide['sections'][t]}" for t in titles
                                             )
                                             slide["status"] = "초안완료"
                                         st.rerun()
+                                with col_btn2:
+                                    if has_content and st.button("지우기", key=f"sec_clear_{s_key}_{sec_title}", use_container_width=True):
+                                        slide.get("sections", {}).pop(sec_title, None)
+                                        st.session_state.pop(edit_key, None)
+                                        st.rerun()
+
+                                # 편집 가능한 본문
+                                if edit_key not in st.session_state:
+                                    st.session_state[edit_key] = sections.get(sec_title, "")
+                                edited = st.text_area(
+                                    f"본문_{sec_title}",
+                                    key=edit_key,
+                                    height=180,
+                                    label_visibility="collapsed",
+                                    placeholder="여기에 직접 작성하거나 'AI 작성' 버튼을 누르세요.",
+                                )
+                                # 편집 결과를 슬라이드에 반영
+                                stored = sections.get(sec_title, "")
+                                if edited != stored:
+                                    if edited.strip():
+                                        slide.setdefault("sections", {})[sec_title] = edited
+                                    else:
+                                        slide.get("sections", {}).pop(sec_title, None)
+                                    # 초안 재조립
+                                    if all(t in slide.get("sections", {}) for t in titles):
+                                        slide["draft"] = "\n\n".join(
+                                            f"### {t}\n{slide['sections'][t]}" for t in titles
+                                        )
+                                        slide["status"] = "초안완료"
+                                    elif slide.get("sections"):
+                                        slide["draft"] = "\n\n".join(
+                                            f"### {t}\n{slide['sections'][t]}" for t in titles if t in slide["sections"]
+                                        )
 
                             # 수동 조립
                             written = [t for t in titles if t in slide.get("sections", {})]

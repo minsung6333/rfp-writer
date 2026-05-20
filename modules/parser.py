@@ -557,8 +557,10 @@ def _call_toc_batch(user_contents: list[dict], pages_batch: list[int], model: st
 
 
 def extract_toc_with_vision(pdf_path: str, pages: list[int], model: str = "gpt-5.4",
-                             batch_size: int = 3, max_workers: int = 4) -> list[dict]:
-    """지정 페이지에서 VLLM으로 목차 추출 (배치 + 병렬)."""
+                             batch_size: int = 3, max_workers: int = 4,
+                             progress_callback=None) -> list[dict]:
+    """지정 페이지에서 VLLM으로 목차 추출 (배치 + 병렬).
+    progress_callback(done, total) 호출됨 (메인 스레드)."""
     if not pages:
         return []
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -567,6 +569,8 @@ def extract_toc_with_vision(pdf_path: str, pages: list[int], model: str = "gpt-5
     valid_pages = [p for p in pages if 1 <= p <= max_p]
     batches = [valid_pages[i:i + batch_size] for i in range(0, len(valid_pages), batch_size)]
     print(f"[VLLM TOC] 총 {len(valid_pages)}페이지, {len(batches)}배치, {max_workers}워커 병렬")
+    if progress_callback:
+        progress_callback(0, len(batches))
 
     # 이미지 렌더링은 메인 스레드에서 순차 (PyMuPDF는 thread-safe 아님)
     payloads = []
@@ -577,6 +581,7 @@ def extract_toc_with_vision(pdf_path: str, pages: list[int], model: str = "gpt-5
 
     # API 호출은 병렬
     results: list[list[dict]] = [[]] * len(batches)
+    done_count = 0
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         future_map = {
             ex.submit(_call_toc_batch, contents, batch, model): idx
@@ -586,7 +591,10 @@ def extract_toc_with_vision(pdf_path: str, pages: list[int], model: str = "gpt-5
             idx = future_map[fut]
             slides = fut.result()
             results[idx] = slides
+            done_count += 1
             print(f"[VLLM TOC] 배치 {idx + 1}/{len(batches)} 완료 → {len(slides)}개")
+            if progress_callback:
+                progress_callback(done_count, len(batches))
 
     # 순서대로 합치고 중복 제거
     all_slides = []
@@ -619,8 +627,10 @@ def _call_parse_batch(user_contents: list[dict], pages_batch: list[int], model: 
 
 
 def parse_pages_with_vision(pdf_path: str, pages: list[int], model: str = "gpt-5.4",
-                             batch_size: int = 3, max_workers: int = 4) -> str:
-    """지정한 페이지들을 이미지로 렌더링해 vision LLM으로 파싱 (배치 + 병렬)."""
+                             batch_size: int = 3, max_workers: int = 4,
+                             progress_callback=None) -> str:
+    """지정한 페이지들을 이미지로 렌더링해 vision LLM으로 파싱 (배치 + 병렬).
+    progress_callback(done, total) 호출됨 (메인 스레드)."""
     if not pages:
         return ""
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -629,6 +639,8 @@ def parse_pages_with_vision(pdf_path: str, pages: list[int], model: str = "gpt-5
     valid_pages = [p for p in pages if 1 <= p <= max_p]
     batches = [valid_pages[i:i + batch_size] for i in range(0, len(valid_pages), batch_size)]
     print(f"[VLLM PARSE] 총 {len(valid_pages)}페이지, {len(batches)}배치, {max_workers}워커 병렬")
+    if progress_callback:
+        progress_callback(0, len(batches))
 
     # 이미지 렌더링은 순차 (PyMuPDF thread-safe 아님)
     payloads = []
@@ -640,6 +652,7 @@ def parse_pages_with_vision(pdf_path: str, pages: list[int], model: str = "gpt-5
     # API 호출은 병렬
     results: list[str] = [""] * len(batches)
     batch_ranges: list[list[int]] = [[]] * len(batches)
+    done_count = 0
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         future_map = {
             ex.submit(_call_parse_batch, contents, batch, model): (idx, batch)
@@ -650,7 +663,10 @@ def parse_pages_with_vision(pdf_path: str, pages: list[int], model: str = "gpt-5
             text = fut.result()
             results[idx] = text
             batch_ranges[idx] = batch
-            print(f"[VLLM PARSE] 배치 {idx + 1}/{len(batches)} 완료 → {len(text)}자")
+            done_count += 1
+            if progress_callback:
+                progress_callback(done_count, len(batches))
+            print(f"[VLLM PARSE] 배치 {done_count}/{len(batches)} 완료 → {len(text)}자")
 
     parts = []
     for idx, text in enumerate(results):
