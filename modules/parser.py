@@ -49,18 +49,26 @@ PROJECT_OVERVIEW_SYSTEM = """당신은 RFP 문서 분석 전문가입니다.
 주어진 RFP 도입부 텍스트(사업 개요·배경·필요성·목적·목표·범위 등)에서
 사업의 핵심 컨텍스트를 추출해 아래 JSON으로 반환하세요.
 
+이 내용은 이후 제안서 작성 전 과정에서 컨텍스트로 활용되므로, **원문의 정보를 풍부하게 보존**해야 합니다.
+
 {
   "project_name": "사업명",
-  "background": "추진 배경 (2~4줄)",
-  "necessity": "추진 필요성 (2~4줄)",
-  "purpose": "사업 목적 (2~3줄)",
-  "goals": "주요 목표 (bullet 또는 줄바꿈으로 3~6개)",
-  "scope": "사업 범위 (2~4줄)",
-  "duration_budget": "사업 기간·예산 (확인 가능한 만큼)",
-  "key_points": "기타 제안사가 알아야 할 핵심 정보 (선택, 2~4줄)"
+  "background": "추진 배경 (원문 문장을 그대로 옮기되 군더더기만 제거, 보통 5~15줄)",
+  "necessity": "추진 필요성 (원문 보존, 필요성 항목이 여러 개면 모두 포함)",
+  "purpose": "사업 목적 (원문 보존)",
+  "goals": "주요 목표 (bullet로 누락 없이 모두 나열, 세부 설명도 포함)",
+  "scope": "사업 범위 (원문의 과업·구축 범위·구성 요소를 빠짐없이 포함)",
+  "duration_budget": "사업 기간·예산·발주처·계약 방식 등 (확인 가능한 모든 사실)",
+  "key_points": "보안·인증·법규·필수요건·평가 가중치 등 제안사가 반드시 알아야 할 정보"
 }
 
-원문에 없는 정보는 빈 문자열로. 추측하지 말 것. 반드시 JSON만 반환."""
+원칙:
+- **요약하지 말고 원문 정보를 최대한 보존** (군더더기·중복 표현만 제거)
+- 표/항목 나열이 있으면 그 구조 유지 (예: 'ㅇ', '▢', '①' 등은 '-' bullet로 변환)
+- 숫자·고유명사·시스템명·기술명·근거 법령은 반드시 그대로 포함
+- 원문에 없는 정보는 빈 문자열로. 추측 금지
+- 각 필드별 길이 상한 없음 — 원문에 풍부한 내용이 있으면 풍부하게 추출
+- 반드시 JSON만 반환"""
 
 
 TOC_FROM_REQS_SYSTEM = """당신은 RFP 제안서 전문가입니다.
@@ -331,14 +339,14 @@ def extract_project_overview(pages: list[dict]) -> dict:
 
     try:
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             messages=[
                 {"role": "system", "content": PROJECT_OVERVIEW_SYSTEM},
                 {"role": "user", "content": text},
             ],
             temperature=0,
             response_format={"type": "json_object"},
-            timeout=60,
+            timeout=120,
         )
         return json.loads(resp.choices[0].message.content or "{}")
     except Exception as e:

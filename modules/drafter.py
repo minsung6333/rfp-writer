@@ -81,10 +81,32 @@ OUTLINE_SYSTEM = """당신은 IT 제안서 전문가입니다.
 - 요구사항을 모두 커버
 - 각 소제목별 **scope(작성 범위)**를 명시: 다른 소제목과 절대 겹치지 않도록 무엇을 다루고 무엇을 안 다루는지 명확히
 - [참고 문서]가 있으면 그 안의 사례·실적·기술 스택을 드러낼 수 있는 소제목 우선
+- [같은 챕터의 다른 슬라이드]가 제공되면 그 슬라이드들의 영역은 절대 침범하지 말 것 (예: 1.4 "추진전략" 슬라이드가 따로 있다면, 현재 슬라이드의 소제목에서 추진전략 내용을 다루지 않음)
 
 JSON 형식으로만 반환:
 {"sections": [
-  {"title": "소제목", "scope": "이 소제목에서 다룰 구체 범위 — 다른 소제목과 겹치지 않게 명확히 한 줄로"}
+  {"title": "소제목", "scope": "이 소제목에서 다룰 구체 범위 — 다른 소제목/슬라이드와 겹치지 않게 명확히 한 줄로"}
+]}"""
+
+CHAPTER_OUTLINE_SYSTEM = """당신은 IT 제안서 전문가입니다.
+한 챕터에 속한 여러 슬라이드들의 소제목을 **동시에** 설계합니다.
+
+핵심 원칙:
+- 모든 슬라이드는 같은 챕터 안에 있으므로, **서로 다루는 영역이 명확히 분리**되어야 함
+- 슬라이드끼리도, 같은 슬라이드 내 소제목끼리도 절대 같은 내용을 중복해서 다루지 않도록 scope를 정의
+- 각 슬라이드는 소제목 4~6개 (장표 성격에 따라 조절 가능, 너무 많이 만들지 말 것)
+- 각 소제목별 scope를 한 줄로 명확히 명시 (무엇을 다루고 무엇을 다른 슬라이드에 양보하는지)
+- [참고 문서], [사업 개요]가 있으면 활용
+
+JSON 형식으로만 반환:
+{"outlines": [
+  {
+    "slide_id": "slide_001",
+    "title": "(참고: 슬라이드 제목)",
+    "sections": [
+      {"title": "소제목", "scope": "구체 범위"}
+    ]
+  }
 ]}"""
 
 SECTION_SYSTEM = """당신은 IT 제안서 작성 전문가입니다.
@@ -104,16 +126,41 @@ SECTION_SYSTEM = """당신은 IT 제안서 작성 전문가입니다.
 - 참고 문서에 없는 내용은 일반론으로 작성하되, 추측성 수치/이름은 사용 금지"""
 
 
+def _build_sibling_block(sibling_slides: list[dict]) -> str:
+    """같은 챕터의 다른 슬라이드 정보를 텍스트로."""
+    if not sibling_slides:
+        return ""
+    lines = ["[같은 챕터의 다른 슬라이드들 — 이 영역은 침범하지 말 것]"]
+    for s in sibling_slides:
+        title = s.get("title", "")
+        outline = s.get("outline", [])
+        sec_titles = [o.get("title", "") if isinstance(o, dict) else str(o) for o in outline]
+        if sec_titles:
+            lines.append(f"- {s.get('section','')} {title} (소제목: {', '.join(sec_titles)})")
+        else:
+            lines.append(f"- {s.get('section','')} {title}")
+    return "\n".join(lines) + "\n\n"
+
+
 def generate_outline(slide: dict, requirements: list[dict], strategy: str,
-                     ref_text: str = "", overview: str = "") -> list[dict]:
+                     ref_text: str = "", overview: str = "",
+                     sibling_slides: list[dict] = None) -> list[dict]:
     """소제목 + scope 리스트 반환: [{"title": "...", "scope": "..."}]"""
     req_context = _build_req_context(requirements, slide.get("linked_reqs", []))
     ref_block = f"\n\n[참고 문서]\n{ref_text[:60000]}" if ref_text else ""
     overview_block = f"[사업 개요]\n{overview}\n\n" if overview else ""
+    sibling_block = _build_sibling_block(sibling_slides or [])
     result = chat(
         [
             {"role": "system", "content": OUTLINE_SYSTEM},
-            {"role": "user", "content": f"{overview_block}[전략 방향]\n{strategy}\n\n[장표] {slide['title']}\n\n[요구사항]\n{req_context}{ref_block}"},
+            {"role": "user", "content": (
+                f"{overview_block}"
+                f"{sibling_block}"
+                f"[전략 방향]\n{strategy}\n\n"
+                f"[장표] {slide['title']}\n\n"
+                f"[요구사항]\n{req_context}"
+                f"{ref_block}"
+            )},
         ],
         model="gpt-4o-mini",
     )
@@ -131,6 +178,67 @@ def generate_outline(slide: dict, requirements: list[dict], strategy: str,
         ]
     except Exception:
         return []
+
+
+def generate_chapter_outlines(slides: list[dict], requirements: list[dict], strategy: str,
+                               ref_text: str = "", overview: str = "") -> dict[str, list[dict]]:
+    """챕터 전체 슬라이드의 outline을 한 번에 생성. {slide_id: [{title, scope}]} 반환."""
+    if not slides:
+        return {}
+    # 각 슬라이드의 요구사항을 함께 묶어서 전달
+    req_map = {r["id"]: r for r in requirements}
+    slide_blocks = []
+    for s in slides:
+        sid = s.get("id", "")
+        title = s.get("title", "")
+        linked = s.get("linked_reqs", [])
+        req_lines = []
+        for rid in linked:
+            r = req_map.get(rid)
+            if r:
+                req_lines.append(f"  - [{rid}] {r.get('name','')}: {r.get('detail','')[:200]}")
+        req_text = "\n".join(req_lines) if req_lines else "  (연결 요구사항 없음)"
+        slide_blocks.append(
+            f"## slide_id: {sid}\n제목: {title}\n연결 요구사항:\n{req_text}"
+        )
+    slides_text = "\n\n".join(slide_blocks)
+
+    ref_block = f"\n\n[참고 문서]\n{ref_text[:40000]}" if ref_text else ""
+    overview_block = f"[사업 개요]\n{overview}\n\n" if overview else ""
+
+    result = chat(
+        [
+            {"role": "system", "content": CHAPTER_OUTLINE_SYSTEM},
+            {"role": "user", "content": (
+                f"{overview_block}"
+                f"[전략 방향]\n{strategy}\n\n"
+                f"[챕터 슬라이드 목록 — 각각의 outline을 모두 만들되 서로 침범 금지]\n{slides_text}"
+                f"{ref_block}"
+            )},
+        ],
+        model="gpt-4o",
+    )
+    try:
+        if "```" in result:
+            result = result.split("```")[1]
+            if result.startswith("json"):
+                result = result[4:]
+        outlines_data = json.loads(result.strip()).get("outlines", [])
+        output = {}
+        for item in outlines_data:
+            sid = item.get("slide_id", "")
+            secs = item.get("sections", [])
+            normalized = [
+                {"title": s, "scope": ""} if isinstance(s, str)
+                else {"title": s.get("title", ""), "scope": s.get("scope", "")}
+                for s in secs if (isinstance(s, str) and s) or (isinstance(s, dict) and s.get("title"))
+            ]
+            if sid and normalized:
+                output[sid] = normalized
+        return output
+    except Exception as e:
+        print(f"챕터 outline 생성 실패: {e}")
+        return {}
 
 
 def _build_section_messages(slide: dict, section_title: str, section_scope: str,

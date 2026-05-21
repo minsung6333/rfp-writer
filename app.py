@@ -19,6 +19,7 @@ from modules.drafter import (
     generate_draft_stream, generate_draft_from_answers_stream,
     revise_draft_stream, review_draft,
     generate_outline, generate_section_stream, generate_section,
+    generate_chapter_outlines,
 )
 
 st.set_page_config(page_title="RFP 제안서 작성기", page_icon="📝", layout="wide")
@@ -600,89 +601,177 @@ with tab_toc:
 
     st.divider()
 
-    # 편집 표
-    import pandas as pd
-    all_req_ids = [r["id"] for r in st.session_state.requirements]
-    toc_df = pd.DataFrame([
-        {
-            "챕터": s.get("chapter", ""),
-            "섹션": s.get("section", ""),
-            "제목": s.get("title", ""),
-            "연결 요구사항": ", ".join(s.get("linked_reqs", [])),
-            "상태": s.get("status", "미작성"),
-        }
-        for s in st.session_state.slides
-    ])
-    edited = st.data_editor(
-        toc_df,
-        num_rows="dynamic",
-        use_container_width=True,
-        height=500,
-        column_config={
-            "챕터": st.column_config.TextColumn("챕터", width="small"),
-            "섹션": st.column_config.TextColumn("섹션", width="small"),
-            "제목": st.column_config.TextColumn("제목", width="large", required=True),
-            "연결 요구사항": st.column_config.TextColumn(
-                "연결 요구사항",
-                help=f"요구사항 ID를 쉼표로 구분 (예: SFR-001, PMR-02). 사용 가능: {len(all_req_ids)}개",
-                width="medium",
-            ),
-            "상태": st.column_config.SelectboxColumn(
-                "상태",
-                options=["미작성", "초안완료", "검토중", "완료"],
-                width="small",
-            ),
-        },
-        key="toc_editor",
-    )
-    col_save, col_re_map, col_dl = st.columns([1, 1, 1])
-    with col_save:
-        if st.button("💾 변경사항 저장", use_container_width=True, type="primary"):
-            req_id_set = set(all_req_ids)
-            new_slides = []
-            for idx, row in edited.iterrows():
-                title = str(row.get("제목", "") or "").strip()
-                if not title:
-                    continue
-                raw_reqs = [r.strip() for r in str(row.get("연결 요구사항", "") or "").split(",") if r.strip()]
-                valid_reqs = [r for r in raw_reqs if r in req_id_set]
-                invalid = [r for r in raw_reqs if r not in req_id_set]
-                existing = st.session_state.slides[idx] if idx < len(st.session_state.slides) else {}
-                new_slides.append({
-                    "id": existing.get("id", f"slide_e_{idx:03d}"),
-                    "chapter": str(row.get("챕터", "") or "").strip(),
-                    "section": str(row.get("섹션", "") or "").strip(),
-                    "title": title,
-                    "linked_reqs": valid_reqs,
-                    "status": str(row.get("상태", "") or "미작성").strip(),
-                    # 기존 sections/outline/draft 보존
-                    **{k: existing[k] for k in ("outline", "sections", "draft") if k in existing},
-                })
-                if invalid:
-                    st.warning(f"행 {idx+1}: 알 수 없는 요구사항 ID {invalid} 무시됨")
-            st.session_state.slides = new_slides
-            st.success(f"✅ {len(new_slides)}개 장표 저장됨")
-            st.rerun()
-    with col_re_map:
+    # ── 슬라이드 편집/추가 모달 ──
+    reqs_all = st.session_state.requirements
+    req_map_all = {r["id"]: r for r in reqs_all}
+    STATUS_OPTS = ["미작성", "초안완료", "검토중", "완료"]
+
+    @st.dialog("슬라이드 편집", width="large")
+    def edit_slide_dialog(idx=None):
+        is_new = idx is None
+        if is_new:
+            slide = {"chapter": "", "section": "", "title": "", "linked_reqs": [], "status": "미작성"}
+        else:
+            slide = dict(st.session_state.slides[idx])
+
+        col_c, col_s, col_st = st.columns([1, 1, 2])
+        chapter_v = col_c.text_input("챕터", value=slide.get("chapter", ""), key=f"dlg_ch_{idx}")
+        section_v = col_s.text_input("섹션", value=slide.get("section", ""), key=f"dlg_sec_{idx}")
+        status_v = col_st.selectbox(
+            "상태", STATUS_OPTS,
+            index=STATUS_OPTS.index(slide.get("status", "미작성")) if slide.get("status") in STATUS_OPTS else 0,
+            key=f"dlg_status_{idx}",
+        )
+        title_v = st.text_input("제목 *", value=slide.get("title", ""), key=f"dlg_title_{idx}")
+
+        # AI 추천 (제목 기반)
+        rec_key = f"dlg_rec_{idx}"
+        col_ms, col_rec = st.columns([5, 1])
+        with col_rec:
+            if st.button("✨ AI 추천", key=f"dlg_btn_rec_{idx}", help="현재 제목으로 요구사항을 LLM이 추천", use_container_width=True):
+                if title_v.strip():
+                    with st.spinner("추천 중..."):
+                        rec = bulk_link_reqs([title_v], reqs_all).get(title_v, [])
+                    st.session_state[rec_key] = rec
+                    st.rerun()
+                else:
+                    st.warning("제목 입력 먼저")
+
+        default_reqs = st.session_state.get(rec_key, slide.get("linked_reqs", []))
+        with col_ms:
+            linked_v = st.multiselect(
+                f"연결 요구사항 ({len(reqs_all)}개 중 선택)",
+                options=list(req_map_all.keys()),
+                default=default_reqs,
+                format_func=lambda rid: f"{rid} — {req_map_all.get(rid, {}).get('name', '')[:60]}",
+                key=f"dlg_reqs_{idx}",
+            )
+
+        # 선택된 요구사항 상세
+        if linked_v:
+            with st.expander(f"📑 선택된 요구사항 상세 ({len(linked_v)}개)", expanded=False):
+                for rid in linked_v:
+                    r = req_map_all.get(rid)
+                    if not r:
+                        continue
+                    st.markdown(f"**`{rid}` {r.get('name', '')}**")
+                    cap_parts = []
+                    if r.get("category"): cap_parts.append(f"분류: {r['category']}")
+                    if cap_parts: st.caption(" · ".join(cap_parts))
+                    if r.get("definition"):
+                        st.markdown(f"- 정의: {r['definition']}")
+                    if r.get("detail"):
+                        st.markdown(f"- 세부: {r['detail'][:400]}{'...' if len(r.get('detail',''))>400 else ''}")
+                    st.divider()
+
+        # 액션 버튼
+        st.markdown("---")
+        if is_new:
+            col_save, col_cancel = st.columns([3, 1])
+            with col_save:
+                if st.button("💾 추가", use_container_width=True, type="primary", key=f"dlg_save_{idx}"):
+                    if not title_v.strip():
+                        st.error("제목은 필수입니다.")
+                    else:
+                        st.session_state.slides.append({
+                            "id": f"slide_{len(st.session_state.slides):03d}",
+                            "chapter": chapter_v.strip(),
+                            "section": section_v.strip(),
+                            "title": title_v.strip(),
+                            "linked_reqs": linked_v,
+                            "status": status_v,
+                        })
+                        st.session_state.pop(rec_key, None)
+                        st.rerun()
+            with col_cancel:
+                if st.button("취소", use_container_width=True, key=f"dlg_cancel_{idx}"):
+                    st.session_state.pop(rec_key, None)
+                    st.rerun()
+        else:
+            col_save, col_cancel, col_del = st.columns([2, 1, 1])
+            with col_save:
+                if st.button("💾 저장", use_container_width=True, type="primary", key=f"dlg_save_{idx}"):
+                    if not title_v.strip():
+                        st.error("제목은 필수입니다.")
+                    else:
+                        existing = st.session_state.slides[idx]
+                        existing.update({
+                            "chapter": chapter_v.strip(),
+                            "section": section_v.strip(),
+                            "title": title_v.strip(),
+                            "linked_reqs": linked_v,
+                            "status": status_v,
+                        })
+                        st.session_state.pop(rec_key, None)
+                        st.rerun()
+            with col_cancel:
+                if st.button("취소", use_container_width=True, key=f"dlg_cancel_{idx}"):
+                    st.session_state.pop(rec_key, None)
+                    st.rerun()
+            with col_del:
+                if st.button("🗑️ 삭제", use_container_width=True, key=f"dlg_del_{idx}"):
+                    st.session_state.slides.pop(idx)
+                    st.session_state.pop(rec_key, None)
+                    st.rerun()
+
+    # 상단 액션 바
+    col_add, col_remap, col_dl = st.columns([1, 1, 1])
+    with col_add:
+        if st.button("➕ 슬라이드 추가", use_container_width=True, type="primary"):
+            edit_slide_dialog()
+    with col_remap:
         if st.button("🔄 요구사항 재매핑 (전체)", use_container_width=True,
                      help="현재 목차의 제목들로 요구사항 매핑을 LLM이 다시 수행합니다 (기존 매핑 덮어씀)"):
             with st.spinner("매핑 중..."):
                 titles = [s["title"] for s in st.session_state.slides]
-                mapping = bulk_link_reqs(titles, st.session_state.requirements)
+                mapping = bulk_link_reqs(titles, reqs_all)
                 for s in st.session_state.slides:
                     s["linked_reqs"] = mapping.get(s["title"], [])
             st.success("재매핑 완료")
             st.rerun()
     with col_dl:
-        excel_bytes2 = build_excel(st.session_state.requirements, st.session_state.slides, st.session_state.get("project_overview"))
+        excel_bytes2 = build_excel(reqs_all, st.session_state.slides, st.session_state.get("project_overview"))
         if excel_bytes2:
             st.download_button(
-                "⬇️ 엑셀 (요구사항+목차)",
+                "⬇️ 엑셀 (개요+요구사항+목차)",
                 data=excel_bytes2,
                 file_name="rfp_요구사항_목차.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
+
+    st.divider()
+
+    # ── 슬라이드 목록 (편집 버튼) ──
+    if not st.session_state.slides:
+        st.info("슬라이드가 없습니다. '➕ 슬라이드 추가' 또는 위 VLLM 추출을 사용하세요.")
+    else:
+        for idx, slide in enumerate(st.session_state.slides):
+            linked = slide.get("linked_reqs", [])
+            col_info, col_edit, col_del = st.columns([7, 1, 1])
+            with col_info:
+                ch_sec = f"{slide.get('chapter','')}-{slide.get('section','')}".strip("-")
+                title = slide.get("title", "(제목 없음)")
+                status = slide.get("status", "미작성")
+                status_icon = {"미작성": "⬜", "초안완료": "✏️", "검토중": "🔍", "완료": "✅"}.get(status, "⬜")
+                st.markdown(f"{status_icon} **{ch_sec} · {title}**")
+                if linked:
+                    names = []
+                    for rid in linked[:4]:
+                        r = req_map_all.get(rid)
+                        nm = r.get("name", "")[:18] if r else ""
+                        names.append(f"`{rid}` {nm}")
+                    more = f" 외 {len(linked)-4}개" if len(linked) > 4 else ""
+                    st.caption(f"📎 {' · '.join(names)}{more}")
+                else:
+                    st.caption("📎 _연결 요구사항 없음_")
+            with col_edit:
+                if st.button("✏️", key=f"row_edit_{idx}", use_container_width=True, help="편집"):
+                    edit_slide_dialog(idx)
+            with col_del:
+                if st.button("🗑️", key=f"row_del_{idx}", use_container_width=True, help="삭제"):
+                    st.session_state.slides.pop(idx)
+                    st.rerun()
 
 # ── 전략 수립 탭 ───────────────────────────────────────────
 with tab_strategy:
@@ -1100,6 +1189,46 @@ with tab_strategy:
                 st.markdown("**장표별 초안 작성**")
                 ch_slides = [s for s in st.session_state.slides if s.get("chapter") == ch]
                 strategy_hint = debate["final_strategy"]
+
+                # 챕터 전체 outline 일괄 생성 (서로 침범 방지)
+                if ch_slides:
+                    missing_outline_count = sum(1 for s in ch_slides if not s.get("outline"))
+                    if st.button(
+                        f"🎯 챕터 전체 outline 일괄 생성 (서로 침범 방지)  [{ch}장 {len(ch_slides)}개 슬라이드]",
+                        use_container_width=True,
+                        type="secondary",
+                        help="모든 슬라이드의 outline을 한 번에 생성하여 서로 다루는 영역이 겹치지 않도록 자동 분배합니다. 기존 outline은 덮어씁니다.",
+                    ):
+                        with st.spinner(f"{len(ch_slides)}개 슬라이드 outline 일괄 생성 중..."):
+                            result = generate_chapter_outlines(
+                                ch_slides, st.session_state.requirements,
+                                strategy_hint, ref_text, overview_text,
+                            )
+                        if not result:
+                            st.error("일괄 생성 실패. 개별 생성을 시도하거나 다시 시도하세요.")
+                        else:
+                            applied = 0
+                            for slide in ch_slides:
+                                sid = slide.get("id", "")
+                                if sid in result:
+                                    slide["outline"] = result[sid]
+                                    # 기존 sections는 그대로 유지하되, outline이 바뀐 항목들은 비움
+                                    new_titles = {o["title"] for o in result[sid]}
+                                    if slide.get("sections"):
+                                        slide["sections"] = {
+                                            k: v for k, v in slide["sections"].items() if k in new_titles
+                                        }
+                                    # 편집 위젯 값 동기화
+                                    s_key = slide.get("id", slide.get("title", ""))
+                                    for t in new_titles:
+                                        ek = f"sec_edit_{s_key}_{t}"
+                                        if t in slide.get("sections", {}):
+                                            st.session_state[ek] = slide["sections"][t]
+                                        else:
+                                            st.session_state.pop(ek, None)
+                                    applied += 1
+                            st.success(f"✅ {applied}/{len(ch_slides)}개 슬라이드 outline 생성 완료")
+                            st.rerun()
                 for slide in ch_slides:
                     s_key = slide.get("id", slide.get("title", ""))
                     slide_reqs = [r for r in st.session_state.requirements if r["id"] in slide.get("linked_reqs", [])]
@@ -1115,7 +1244,11 @@ with tab_strategy:
                             btn_label = "목차 재생성" if outline else "목차 생성"
                             if st.button(btn_label, key=f"outline_{s_key}", use_container_width=True):
                                 with st.spinner("목차 생성 중..."):
-                                    slide["outline"] = generate_outline(slide, slide_reqs, strategy_hint, ref_text, overview_text)
+                                    siblings = [s for s in ch_slides if s.get("id") != slide.get("id")]
+                                    slide["outline"] = generate_outline(
+                                        slide, slide_reqs, strategy_hint, ref_text, overview_text,
+                                        sibling_slides=siblings,
+                                    )
                                     slide.setdefault("sections", {})
                                 st.rerun()
 
