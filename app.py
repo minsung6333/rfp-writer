@@ -30,6 +30,7 @@ for key, default in [
     ("requirements", []),
     ("slides", []),
     ("project_overview", {}),
+    ("idea_chats", {}),
     ("selected_slide_id", None),
     ("qa_buffers", {}),
     ("debate", {
@@ -46,6 +47,7 @@ for key, default in [
         "selected_reqs": [],
         "final_strategy": "",
         "user_addition": "",
+        "active_ideas": [],
     }),
 ]:
     if key not in st.session_state:
@@ -244,6 +246,7 @@ with st.sidebar:
                 "requirements": st.session_state.get("requirements", []),
                 "slides": st.session_state.get("slides", []),
                 "project_overview": st.session_state.get("project_overview", {}),
+                "idea_chats": st.session_state.get("idea_chats", {}),
                 "debate": st.session_state.get("debate", {}),
                 "qa_buffers": st.session_state.get("qa_buffers", {}),
                 "selected_slide_id": st.session_state.get("selected_slide_id"),
@@ -273,7 +276,7 @@ with st.sidebar:
         if uploaded_session and st.button("📂 불러오기", use_container_width=True, type="primary"):
             try:
                 data = json.loads(uploaded_session.read().decode("utf-8"))
-                for k in ["requirements", "slides", "project_overview", "debate", "qa_buffers", "selected_slide_id"]:
+                for k in ["requirements", "slides", "project_overview", "idea_chats", "debate", "qa_buffers", "selected_slide_id"]:
                     if k in data:
                         st.session_state[k] = data[k]
                 st.success(f"✅ 복원 완료 (저장 시각: {data.get('saved_at', '-')})")
@@ -426,7 +429,9 @@ if not st.session_state.slides:
     st.stop()
 
 # 파싱 결과 확인 탭
-tab_strategy, tab_reqs, tab_toc = st.tabs(["🎯 전략 수립", "📊 요구사항 목록", "🗂️ 목차 구성"])
+tab_strategy, tab_ideas, tab_reqs, tab_toc = st.tabs(
+    ["🎯 전략 수립", "💡 기능 아이디어 도출", "📊 요구사항 목록", "🗂️ 목차 구성"]
+)
 
 with tab_reqs:
     import pandas as pd
@@ -773,6 +778,260 @@ with tab_toc:
                     st.session_state.slides.pop(idx)
                     st.rerun()
 
+# ── 💡 기능 아이디어 도출 탭 ───────────────────────────────────────────
+with tab_ideas:
+    from modules.idea_chat import generate_initial_message, agentic_chat, agentic_chat_stream, summarize_idea_chat
+    from modules.parser import format_overview_text as _fmt_ov, extract_text_by_page as _extract_pages, parse_pages_with_vision as _parse_vision, parse_page_range as _parse_range
+
+    overview_text_ideas = _fmt_ov(st.session_state.get("project_overview", {}))
+    reqs_idea = st.session_state.requirements
+    req_map_idea = {r["id"]: r for r in reqs_idea}
+    idea_chats = st.session_state.idea_chats
+
+    col_top, col_chat = st.columns([1, 3])
+
+    with col_top:
+        st.subheader("주제 관리")
+
+        # 새 주제 만들기
+        with st.expander("➕ 새 주제", expanded=not bool(idea_chats)):
+            new_topic_name = st.text_input("주제명", placeholder="예: RAG 검색 정확도", key="new_topic_name")
+            new_topic_reqs = st.multiselect(
+                "연결 요구사항 (선택)",
+                options=[r["id"] for r in reqs_idea],
+                format_func=lambda rid: f"{rid} — {req_map_idea.get(rid, {}).get('name', '')[:40]}",
+                key="new_topic_reqs",
+            )
+            if st.button("➕ 주제 만들기", use_container_width=True, type="primary", disabled=not new_topic_name.strip()):
+                tname = new_topic_name.strip()
+                if tname in idea_chats:
+                    st.error("이미 있는 주제명입니다.")
+                else:
+                    linked = [req_map_idea[rid] for rid in new_topic_reqs if rid in req_map_idea]
+                    with st.spinner("AI 초기 분석 중..."):
+                        initial = generate_initial_message(tname, linked, overview_text_ideas)
+                    idea_chats[tname] = {
+                        "linked_reqs": new_topic_reqs,
+                        "messages": [{"role": "assistant", "content": initial,
+                                      "search_calls": [], "citations": [], "need_doc": ""}],
+                        "summary": "",
+                        "use_search": True,
+                    }
+                    st.session_state.active_idea_topic = tname
+                    st.rerun()
+
+        # 기존 주제 목록
+        st.markdown("**주제 목록**")
+        if not idea_chats:
+            st.caption("아직 주제가 없습니다. 위에서 새 주제를 만드세요.")
+        else:
+            active = st.session_state.get("active_idea_topic")
+            if active not in idea_chats:
+                active = list(idea_chats.keys())[0]
+                st.session_state.active_idea_topic = active
+            for tname, chat in idea_chats.items():
+                msg_count = len(chat.get("messages", []))
+                sum_icon = "✅" if chat.get("summary") else "⬜"
+                is_active = tname == active
+                btn_label = f"{'▶ ' if is_active else ''}{sum_icon} {tname} ({msg_count})"
+                if st.button(btn_label, key=f"topic_btn_{tname}", use_container_width=True):
+                    st.session_state.active_idea_topic = tname
+                    st.rerun()
+
+        # 주제 삭제
+        if idea_chats and st.session_state.get("active_idea_topic"):
+            active = st.session_state.active_idea_topic
+            with st.expander("⚙️ 주제 설정"):
+                # 연결 요구사항 편집
+                cur_reqs = idea_chats[active].get("linked_reqs", [])
+                new_reqs = st.multiselect(
+                    "연결 요구사항",
+                    options=[r["id"] for r in reqs_idea],
+                    default=cur_reqs,
+                    format_func=lambda rid: f"{rid} — {req_map_idea.get(rid, {}).get('name', '')[:40]}",
+                    key=f"edit_reqs_{active}",
+                )
+                if new_reqs != cur_reqs:
+                    idea_chats[active]["linked_reqs"] = new_reqs
+
+                use_search = st.toggle(
+                    "🔍 웹 검색 활성화",
+                    value=idea_chats[active].get("use_search", True),
+                    key=f"use_search_{active}",
+                    help="끄면 LLM이 자체 지식만으로 답변 (빠름·저렴)",
+                )
+                idea_chats[active]["use_search"] = use_search
+
+                if st.button("🗑️ 주제 삭제", use_container_width=True, key=f"del_topic_{active}"):
+                    del idea_chats[active]
+                    st.session_state.pop("active_idea_topic", None)
+                    st.rerun()
+
+    with col_chat:
+        active = st.session_state.get("active_idea_topic")
+        if not active or active not in idea_chats:
+            st.info("👈 왼쪽에서 주제를 만들거나 선택하세요.")
+        else:
+            chat = idea_chats[active]
+            linked_objs = [req_map_idea[rid] for rid in chat.get("linked_reqs", []) if rid in req_map_idea]
+            st.subheader(f"💬 {active}")
+            if linked_objs:
+                st.caption("📎 " + " · ".join([f"`{r['id']}` {r.get('name','')[:25]}" for r in linked_objs[:5]]) + (f" 외 {len(linked_objs)-5}개" if len(linked_objs) > 5 else ""))
+
+            # 채팅 history 표시
+            for i, msg in enumerate(chat["messages"]):
+                role = msg["role"]
+                with st.chat_message(role, avatar="🤖" if role == "assistant" else "👤"):
+                    content = msg.get("content", "")
+                    st.markdown(content)
+
+                    # 검색 호출 표시
+                    search_calls = msg.get("search_calls", [])
+                    if search_calls:
+                        with st.expander(f"🔍 {len(search_calls)}회 웹 검색 수행"):
+                            for sc in search_calls:
+                                q = sc.get("query", "")
+                                if q:
+                                    st.caption(f"• {q}")
+
+                    # 인용 표시
+                    citations = msg.get("citations", [])
+                    if citations:
+                        with st.expander(f"📎 출처 {len(citations)}건"):
+                            for c in citations:
+                                title = c.get("title", "(제목 없음)")
+                                url = c.get("url", "")
+                                st.markdown(f"- [{title}]({url})")
+
+                    # 문서 요청
+                    need_doc = msg.get("need_doc", "")
+                    doc_handled = msg.get("doc_handled", False)
+                    if need_doc and not doc_handled and role == "assistant":
+                        st.warning(f"📎 **문서 요청:** {need_doc}")
+                        col_up, col_skip = st.columns([2, 1])
+                        with col_up:
+                            up_doc = st.file_uploader(
+                                "PDF 첨부", type=["pdf"],
+                                key=f"idea_doc_{active}_{i}",
+                                label_visibility="collapsed",
+                            )
+                        if up_doc and st.button("문서 제출", key=f"idea_doc_submit_{active}_{i}", use_container_width=True, type="primary"):
+                            import tempfile, os as _os
+                            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                                tmp.write(up_doc.read())
+                                tmp_path = tmp.name
+                            with st.spinner("문서 파싱 중..."):
+                                pgs = _extract_pages(tmp_path)
+                                doc_txt = "\n\n".join(f"[p{p['page']}]\n{p['text']}" for p in pgs[:10])
+                            _os.remove(tmp_path)
+                            msg["doc_handled"] = True
+                            chat["messages"].append({
+                                "role": "user",
+                                "content": f"[문서 첨부됨: {up_doc.name}]\n{doc_txt[:8000]}",
+                            })
+                            chat["_pending"] = True
+                            st.rerun()
+                        with col_skip:
+                            if st.button("건너뛰기", key=f"idea_doc_skip_{active}_{i}", use_container_width=True):
+                                msg["doc_handled"] = True
+                                st.rerun()
+
+            # 자동 압축 상태 표시
+            if chat.get("compact_summary"):
+                with st.expander(f"🗜️ 이전 대화 자동 요약 (LLM이 보는 컨텍스트)", expanded=False):
+                    st.markdown(chat["compact_summary"])
+
+            # Pending 상태: 유저 메시지는 이미 표시됨, AI 응답 생성 중
+            if chat.get("_pending"):
+                with st.chat_message("assistant", avatar="🤖"):
+                    with st.status("처리 중...", expanded=True) as status:
+                        stage_box = st.empty()
+                        text_box = st.empty()
+                        search_log_box = st.empty()
+
+                        accumulated_text = ""
+                        searches_done = []
+                        result_data = {}
+
+                        for ev_type, payload in agentic_chat_stream(
+                            chat["messages"], active, linked_objs,
+                            overview_text_ideas, "", chat.get("use_search", True),
+                            cached_summary=chat.get("compact_summary", ""),
+                            cached_until_idx=chat.get("compact_until_idx", 0),
+                        ):
+                            if ev_type == "stage":
+                                status.update(label=payload)
+                                stage_box.caption(payload)
+                            elif ev_type == "search":
+                                searches_done.append(payload)
+                                with search_log_box.container():
+                                    for q in searches_done:
+                                        st.caption(f"🔍 검색: `{q}`")
+                            elif ev_type == "text_delta":
+                                accumulated_text += payload
+                                text_box.markdown(accumulated_text)
+                            elif ev_type == "compact":
+                                summary_text, until_idx = payload
+                                chat["compact_summary"] = summary_text
+                                chat["compact_until_idx"] = until_idx
+                            elif ev_type == "done":
+                                result_data = payload
+
+                        status.update(label="✅ 완료", state="complete", expanded=False)
+
+                # 최종 메시지 저장
+                chat["messages"].append({
+                    "role": "assistant",
+                    "content": result_data.get("text", ""),
+                    "search_calls": result_data.get("search_calls", []),
+                    "citations": result_data.get("citations", []),
+                    "need_doc": result_data.get("need_doc", ""),
+                })
+                chat["_pending"] = False
+                st.rerun()
+
+            # 채팅 입력
+            user_input = st.chat_input(f"'{active}' 주제로 이야기해주세요...")
+            if user_input:
+                chat["messages"].append({"role": "user", "content": user_input})
+                chat["_pending"] = True
+                st.rerun()
+
+            st.divider()
+
+            # 아이디어 정리
+            col_sum, col_dl = st.columns(2)
+            with col_sum:
+                if st.button("🎯 아이디어 정리", use_container_width=True, type="primary",
+                             disabled=len(chat["messages"]) < 3):
+                    with st.spinner("정리 중..."):
+                        summary = summarize_idea_chat(chat["messages"], active, overview_text_ideas)
+                    chat["summary"] = summary
+                    st.rerun()
+            with col_dl:
+                if chat.get("summary"):
+                    st.download_button(
+                        "⬇️ 정리본 다운로드",
+                        data=chat["summary"].encode("utf-8"),
+                        file_name=f"아이디어_{active}.md",
+                        mime="text/markdown",
+                        use_container_width=True,
+                    )
+
+            # 정리본 표시 (편집 가능)
+            if chat.get("summary"):
+                with st.expander("📋 정리된 아이디어 (편집 가능)", expanded=True):
+                    edited_sum = st.text_area(
+                        "정리본",
+                        value=chat["summary"],
+                        height=400,
+                        key=f"sum_edit_{active}",
+                        label_visibility="collapsed",
+                    )
+                    if edited_sum != chat["summary"]:
+                        chat["summary"] = edited_sum
+
+
 # ── 전략 수립 탭 ───────────────────────────────────────────
 with tab_strategy:
     from modules.strategist import (
@@ -848,7 +1107,33 @@ with tab_strategy:
 
         max_rounds = st.radio("라운드 수", [2, 3], index=0, horizontal=True)
 
+        # 💡 활용할 아이디어 (정리본이 있는 주제만)
+        available_ideas = {
+            tname: chat for tname, chat in st.session_state.idea_chats.items()
+            if chat.get("summary", "").strip()
+        }
+        selected_ideas = []
+        if available_ideas:
+            selected_ideas = st.multiselect(
+                "💡 활용할 아이디어",
+                options=list(available_ideas.keys()),
+                default=[],
+                help="기능 아이디어 도출 탭에서 정리한 아이디어를 토론 컨텍스트로 활용",
+                key="strategy_ideas_select",
+            )
+        elif st.session_state.idea_chats:
+            st.caption("💡 정리된 아이디어가 없습니다. 아이디어 도출 탭에서 '🎯 아이디어 정리' 먼저 진행")
+
         if st.button("🎯 전략 수립 시작", use_container_width=True, type="primary"):
+            # 선택한 아이디어를 ref_text_cache에 미리 넣기
+            initial_ref = ""
+            if selected_ideas:
+                idea_parts = []
+                for tname in selected_ideas:
+                    summary = available_ideas[tname].get("summary", "")
+                    idea_parts.append(f"=== 💡 아이디어: {tname} ===\n{summary}")
+                initial_ref = "\n\n".join(idea_parts)
+
             st.session_state.debate = {
                 "chapter": selected_ch,
                 "selected_reqs": selected_reqs,
@@ -860,8 +1145,9 @@ with tab_strategy:
                 "pending_agent": "",
                 "pending_doc_request": "",
                 "pending_doc_queue": [],
-                "ref_text_cache": "",
+                "ref_text_cache": initial_ref,
                 "final_strategy": "",
+                "active_ideas": selected_ideas,
                 "user_addition": "",
             }
             st.rerun()
