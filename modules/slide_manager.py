@@ -1,11 +1,7 @@
 # -*- coding: utf-8 -*-
 import json
-from openai import OpenAI
-from dotenv import load_dotenv
 import os
-
-load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+from .llm import client
 
 CLASSIFY_SYSTEM = """당신은 IT 제안서 작성 전문가입니다.
 장표 제목과 연결된 요구사항을 보고 아래 기준으로 분류하세요.

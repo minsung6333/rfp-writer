@@ -1,10 +1,20 @@
 # -*- coding: utf-8 -*-
 import os
 from openai import OpenAI
-from dotenv import load_dotenv
 
-load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+def _get_api_key():
+    """API 키 우선순위: 환경변수 → st.secrets → .env"""
+    key = os.getenv("OPENAI_API_KEY")
+    if key:
+        return key
+    try:
+        import streamlit as st
+        return st.secrets["OPENAI_API_KEY"]
+    except Exception:
+        pass
+    return None
+
+client = OpenAI(api_key=_get_api_key())
 
 
 def chat_stream(messages: list[dict], model: str = "gpt-4o", max_tokens: int = 4096):

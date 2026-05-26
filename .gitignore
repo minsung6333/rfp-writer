@@ -20,6 +20,12 @@ __pycache__/
 .vscode/
 .idea/
 
+# 배포 zip
+*.zip
+
+# 샘플 데이터
+샘플 데이터/
+
 # 사용자 작업물 (다운로드한 MD/엑셀 등)
 *.md.bak
 

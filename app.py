@@ -1,9 +1,44 @@
 # -*- coding: utf-8 -*-
 import os, json, tempfile, io, datetime
 import streamlit as st
-from dotenv import load_dotenv
 
-load_dotenv()
+# API 키: .env → st.secrets 순서로 탐색
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+# secrets에서 API 키 로딩 (Streamlit Cloud 배포용)
+if not os.getenv("OPENAI_API_KEY"):
+    try:
+        os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
+    except Exception:
+        pass
+
+st.set_page_config(page_title="RFP 제안서 작성기", page_icon="📝", layout="wide")
+
+# ── 비밀번호 잠금 ──
+def _check_password():
+    """앱 접근 비밀번호 확인. secrets에 APP_PASSWORD가 없으면 잠금 해제."""
+    try:
+        correct_pw = st.secrets["APP_PASSWORD"]
+    except Exception:
+        return True  # 비밀번호 미설정 → 잠금 없음 (로컬 개발용)
+    if st.session_state.get("authenticated"):
+        return True
+    st.title("🔒 RFP 제안서 작성기")
+    pw = st.text_input("비밀번호를 입력하세요", type="password", key="pw_input")
+    if st.button("로그인", type="primary"):
+        if pw == correct_pw:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("비밀번호가 틀렸습니다.")
+    return False
+
+if not _check_password():
+    st.stop()
 
 from modules.parser import (
     extract_text_by_page, find_requirement_pages, find_toc_pages,
@@ -21,8 +56,6 @@ from modules.drafter import (
     generate_outline, generate_section_stream, generate_section,
     generate_chapter_outlines,
 )
-
-st.set_page_config(page_title="RFP 제안서 작성기", page_icon="📝", layout="wide")
 
 STATUS_ICON = {"미작성": "⬜", "질문중": "💬", "초안완료": "📝", "검토중": "⚠️", "완료": "✅"}
 
@@ -687,11 +720,11 @@ with tab_toc:
                             "status": status_v,
                         })
                         st.session_state.pop(rec_key, None)
-                        st.rerun()
+                        st.rerun(scope="app")
             with col_cancel:
                 if st.button("취소", use_container_width=True, key=f"dlg_cancel_{idx}"):
                     st.session_state.pop(rec_key, None)
-                    st.rerun()
+                    st.rerun(scope="app")
         else:
             col_save, col_cancel, col_del = st.columns([2, 1, 1])
             with col_save:
@@ -708,16 +741,16 @@ with tab_toc:
                             "status": status_v,
                         })
                         st.session_state.pop(rec_key, None)
-                        st.rerun()
+                        st.rerun(scope="app")
             with col_cancel:
                 if st.button("취소", use_container_width=True, key=f"dlg_cancel_{idx}"):
                     st.session_state.pop(rec_key, None)
-                    st.rerun()
+                    st.rerun(scope="app")
             with col_del:
                 if st.button("🗑️ 삭제", use_container_width=True, key=f"dlg_del_{idx}"):
                     st.session_state.slides.pop(idx)
                     st.session_state.pop(rec_key, None)
-                    st.rerun()
+                    st.rerun(scope="app")
 
     # 상단 액션 바
     col_add, col_remap, col_dl = st.columns([1, 1, 1])
@@ -908,27 +941,56 @@ with tab_ideas:
                     doc_handled = msg.get("doc_handled", False)
                     if need_doc and not doc_handled and role == "assistant":
                         st.warning(f"📎 **문서 요청:** {need_doc}")
-                        col_up, col_skip = st.columns([2, 1])
+                        col_up, col_pg, col_skip = st.columns([3, 2, 1])
                         with col_up:
                             up_doc = st.file_uploader(
-                                "PDF 첨부", type=["pdf"],
+                                "파일 첨부", type=["pdf", "jpg", "jpeg", "png", "gif", "webp", "bmp"],
                                 key=f"idea_doc_{active}_{i}",
                                 label_visibility="collapsed",
                             )
+                        with col_pg:
+                            nd_pages = st.text_input(
+                                "페이지", placeholder="예: 1-5, 10 (PDF만)",
+                                key=f"idea_doc_pages_{active}_{i}",
+                                label_visibility="collapsed",
+                                disabled=not (up_doc and up_doc.name.lower().endswith(".pdf")),
+                            )
                         if up_doc and st.button("문서 제출", key=f"idea_doc_submit_{active}_{i}", use_container_width=True, type="primary"):
-                            import tempfile, os as _os
-                            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-                                tmp.write(up_doc.read())
-                                tmp_path = tmp.name
-                            with st.spinner("문서 파싱 중..."):
-                                pgs = _extract_pages(tmp_path)
-                                doc_txt = "\n\n".join(f"[p{p['page']}]\n{p['text']}" for p in pgs[:10])
-                            _os.remove(tmp_path)
+                            from modules.parser import parse_pages_with_vision, parse_images_with_vision
+                            fname = up_doc.name.lower()
+                            file_bytes = up_doc.read()
+                            if fname.endswith(".pdf"):
+                                import tempfile, os as _os
+                                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                                    tmp.write(file_bytes)
+                                    tmp_path = tmp.name
+                                target_pages = []
+                                if nd_pages.strip():
+                                    for part in nd_pages.split(","):
+                                        part = part.strip()
+                                        if "-" in part:
+                                            s, e = part.split("-", 1)
+                                            try: target_pages.extend(range(int(s), int(e) + 1))
+                                            except ValueError: pass
+                                        else:
+                                            try: target_pages.append(int(part))
+                                            except ValueError: pass
+                                if not target_pages:
+                                    import fitz
+                                    doc_f = fitz.open(tmp_path)
+                                    total_p = len(doc_f)
+                                    doc_f.close()
+                                    target_pages = list(range(1, min(total_p + 1, 11)))
+                                with st.spinner(f"📄 VLLM 문서 분석 중... ({len(target_pages)}페이지)"):
+                                    doc_txt = parse_pages_with_vision(tmp_path, target_pages)
+                                _os.remove(tmp_path)
+                                content_label = f"[문서 첨부: {up_doc.name} (p.{','.join(map(str, target_pages))})]\n{doc_txt[:12000]}"
+                            else:
+                                with st.spinner("🖼️ VLLM 이미지 분석 중..."):
+                                    doc_txt = parse_images_with_vision([(up_doc.name, file_bytes)])
+                                content_label = f"[이미지 첨부: {up_doc.name}]\n{doc_txt[:8000]}"
                             msg["doc_handled"] = True
-                            chat["messages"].append({
-                                "role": "user",
-                                "content": f"[문서 첨부됨: {up_doc.name}]\n{doc_txt[:8000]}",
-                            })
+                            chat["messages"].append({"role": "user", "content": content_label})
                             chat["_pending"] = True
                             st.rerun()
                         with col_skip:
@@ -990,10 +1052,69 @@ with tab_ideas:
                 chat["_pending"] = False
                 st.rerun()
 
-            # 채팅 입력
-            user_input = st.chat_input(f"'{active}' 주제로 이야기해주세요...")
-            if user_input:
-                chat["messages"].append({"role": "user", "content": user_input})
+            # 채팅 입력 + 파일 첨부
+            user_input = st.text_area(
+                "메시지 입력", placeholder=f"'{active}' 주제로 이야기해주세요...",
+                key=f"idea_input_{active}", label_visibility="collapsed", height=80,
+            )
+            col_file, col_pages, col_send = st.columns([3, 2, 1])
+            with col_file:
+                attach_file = st.file_uploader(
+                    "📎 파일 첨부 (PDF, 이미지)", type=["pdf", "jpg", "jpeg", "png", "gif", "webp", "bmp"],
+                    key=f"idea_attach_{active}_{len(chat['messages'])}",
+                    label_visibility="collapsed",
+                )
+            with col_pages:
+                attach_pages = st.text_input(
+                    "페이지", placeholder="예: 1-5, 10 (PDF만, 비우면 전체)",
+                    key=f"idea_pages_{active}_{len(chat['messages'])}",
+                    label_visibility="collapsed",
+                    disabled=not (attach_file and attach_file.name.lower().endswith(".pdf")),
+                )
+            with col_send:
+                send_clicked = st.button("전송", use_container_width=True, type="primary",
+                                         key=f"idea_send_{active}")
+            if send_clicked and (user_input.strip() or attach_file):
+                from modules.parser import parse_pages_with_vision, parse_images_with_vision
+                content_parts = []
+                if attach_file:
+                    fname = attach_file.name.lower()
+                    file_bytes = attach_file.read()
+                    if fname.endswith(".pdf"):
+                        import tempfile, os as _os
+                        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                            tmp.write(file_bytes)
+                            tmp_path = tmp.name
+                        # 페이지 파싱
+                        target_pages = []
+                        if attach_pages.strip():
+                            for part in attach_pages.split(","):
+                                part = part.strip()
+                                if "-" in part:
+                                    s, e = part.split("-", 1)
+                                    try: target_pages.extend(range(int(s), int(e) + 1))
+                                    except ValueError: pass
+                                else:
+                                    try: target_pages.append(int(part))
+                                    except ValueError: pass
+                        if not target_pages:
+                            import fitz
+                            doc_f = fitz.open(tmp_path)
+                            total_p = len(doc_f)
+                            doc_f.close()
+                            target_pages = list(range(1, min(total_p + 1, 11)))  # 최대 10페이지
+                        with st.spinner(f"📄 VLLM 문서 분석 중... ({len(target_pages)}페이지)"):
+                            doc_txt = parse_pages_with_vision(tmp_path, target_pages)
+                        _os.remove(tmp_path)
+                        content_parts.append(f"[문서 첨부: {attach_file.name} (p.{','.join(map(str, target_pages))})]\n{doc_txt[:12000]}")
+                    else:
+                        # 이미지 파일
+                        with st.spinner("🖼️ VLLM 이미지 분석 중..."):
+                            doc_txt = parse_images_with_vision([(attach_file.name, file_bytes)])
+                        content_parts.append(f"[이미지 첨부: {attach_file.name}]\n{doc_txt[:8000]}")
+                if user_input.strip():
+                    content_parts.append(user_input.strip())
+                chat["messages"].append({"role": "user", "content": "\n\n".join(content_parts)})
                 chat["_pending"] = True
                 st.rerun()
 

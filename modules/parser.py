@@ -3,12 +3,8 @@ import json
 import base64
 import fitz  # PyMuPDF
 import pdfplumber
-from openai import OpenAI
-from dotenv import load_dotenv
 import os
-
-load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+from .llm import client
 
 REQ_PARSE_SYSTEM = """당신은 RFP 문서 분석 전문가입니다.
 주어진 텍스트에서 제안사가 수행해야 할 요구사항/과업을 추출하여 아래 형식의 JSON으로 반환하세요.
@@ -805,3 +801,31 @@ def parse_pages_with_vision(pdf_path: str, pages: list[int], model: str = "gpt-5
         if text.strip():
             parts.append(f"### 페이지 {batch_ranges[idx]}\n{text}")
     return "\n\n".join(parts)
+
+
+def parse_images_with_vision(image_bytes_list: list[tuple[str, bytes]], model: str = "gpt-5.4") -> str:
+    """이미지 파일(jpg/png 등)을 VLLM으로 분석. [(filename, bytes), ...] → 텍스트."""
+    if not image_bytes_list:
+        return ""
+    contents: list[dict] = [{"type": "text", "text": "다음 이미지들을 분석하여 표, 텍스트, 도식 등 모든 내용을 정리해주세요."}]
+    for fname, img_bytes in image_bytes_list:
+        ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else "png"
+        mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+                "gif": "image/gif", "webp": "image/webp", "bmp": "image/bmp"}.get(ext, "image/png")
+        b64 = base64.b64encode(img_bytes).decode()
+        contents.append({"type": "text", "text": f"\n=== {fname} ==="})
+        contents.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}", "detail": "high"}})
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": VISION_PARSE_SYSTEM},
+                {"role": "user", "content": contents},
+            ],
+            temperature=0,
+            reasoning_effort="none",
+            timeout=240,
+        )
+        return resp.choices[0].message.content or ""
+    except Exception as e:
+        return f"[VLLM 이미지 분석 실패: {e}]"

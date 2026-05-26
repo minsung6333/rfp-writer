@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
 import json, os
-from openai import OpenAI
-
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+from .llm import client
 
 NEED_INFO_TAG = "[NEED_INFO]"
 NEED_DOC_TAG = "[NEED_DOC]"
