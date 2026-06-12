@@ -928,8 +928,19 @@ def parse_requirements_with_vision(pdf_path: str, pages: list[int], model: str =
     doc = fitz.open(pdf_path)
     max_p = len(doc)
     valid_pages = [p for p in pages if 1 <= p <= max_p]
-    batches = [valid_pages[i:i + batch_size] for i in range(0, len(valid_pages), batch_size)]
-    print(f"[VLLM REQ] 총 {len(valid_pages)}페이지, {len(batches)}배치, {max_workers}워커")
+    # 배치를 1페이지씩 겹치게(overlap) 구성 — 표가 페이지 경계에서 잘려도
+    # 직전 페이지가 다음 배치에 함께 들어가 한 요구사항이 통째로 보이게 한다.
+    batches = []
+    i = 0
+    while i < len(valid_pages):
+        batch = valid_pages[i:i + batch_size]
+        if batches:  # 첫 배치 제외, 직전 배치의 마지막 페이지를 앞에 덧붙임
+            prev_last = batches[-1][-1]
+            if prev_last not in batch:
+                batch = [prev_last] + batch
+        batches.append(batch)
+        i += batch_size
+    print(f"[VLLM REQ] 총 {len(valid_pages)}페이지, {len(batches)}배치(overlap), {max_workers}워커")
     if progress_callback:
         progress_callback(0, len(batches))
 
@@ -957,11 +968,24 @@ def parse_requirements_with_vision(pdf_path: str, pages: list[int], model: str =
                 progress_callback(done_count, len(batches))
             print(f"[VLLM REQ] 배치 {done_count}/{len(batches)} 완료 → {len(results[idx])}건")
 
-    # 병합 + ID 중복 제거 (페이지 경계 중복 대비)
-    merged, seen = [], set()
+    # 병합 + ID 중복 제거. overlap으로 같은 ID가 두 배치에 나올 수 있으므로,
+    # detail이 더 긴(=경계에서 안 잘린) 쪽을 채택하고 순서는 첫 등장 순으로 유지한다.
+    order: list[str] = []
+    best: dict[str, dict] = {}
     for batch_reqs in results:
         for r in batch_reqs:
-            if r["id"] not in seen:
-                seen.add(r["id"])
-                merged.append(r)
+            rid = r["id"]
+            if rid not in best:
+                best[rid] = r
+                order.append(rid)
+            else:
+                # 더 풍부한 정보(상세설명 길이 기준)를 가진 항목으로 교체
+                cur = best[rid]
+                if len(r.get("detail", "")) > len(cur.get("detail", "")):
+                    # 비어 있는 필드는 기존 값으로 보완
+                    for k in ("category", "name", "level", "definition"):
+                        if not r.get(k) and cur.get(k):
+                            r[k] = cur[k]
+                    best[rid] = r
+    merged = [best[rid] for rid in order]
     return normalize_categories(merged)
