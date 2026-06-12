@@ -500,6 +500,30 @@ def split_req_chunks(text: str, chunk_size: int = 8000) -> list[str]:
     return chunks
 
 
+def normalize_categories(requirements: list[dict]) -> list[dict]:
+    """같은 ID 접두사를 가진 요구사항은 하나의 카테고리로 통일.
+    RFP마다 접두사 규칙(TER=테스트 vs 기술 등)이 다르므로 하드코딩하지 않고,
+    접두사별 '최빈 카테고리'로 통일한다. (예: PMR 항목이 '프로젝트관리'/'프로젝트 관리'로
+    섞여 들어와도 한 그룹으로 합쳐짐)"""
+    import re as _re
+    from collections import Counter
+    prefix_re = _re.compile(r'^([A-Z]{2,4})-')
+    by_prefix: dict[str, Counter] = {}
+    for r in requirements:
+        m = prefix_re.match((r.get("id") or "").strip())
+        if not m:
+            continue
+        cat = (r.get("category") or "").strip()
+        if cat:
+            by_prefix.setdefault(m.group(1), Counter())[cat] += 1
+    canon = {pre: cnt.most_common(1)[0][0] for pre, cnt in by_prefix.items() if cnt}
+    for r in requirements:
+        m = prefix_re.match((r.get("id") or "").strip())
+        if m and m.group(1) in canon:
+            r["category"] = canon[m.group(1)]
+    return requirements
+
+
 def parse_requirements_with_llm(text: str) -> list[dict]:
     from concurrent.futures import ThreadPoolExecutor
     chunks = split_req_chunks(text)
@@ -512,7 +536,7 @@ def parse_requirements_with_llm(text: str) -> list[dict]:
                 if rid and rid not in seen_ids:
                     seen_ids.add(rid)
                     all_requirements.append(req)
-    return all_requirements
+    return normalize_categories(all_requirements)
 
 
 def parse_toc_with_llm(text: str) -> list[dict]:
@@ -829,3 +853,115 @@ def parse_images_with_vision(image_bytes_list: list[tuple[str, bytes]], model: s
         return resp.choices[0].message.content or ""
     except Exception as e:
         return f"[VLLM 이미지 분석 실패: {e}]"
+
+
+# ── VLM 기반 요구사항 추출 (표 형식 RFP에 강함) ───────────────────────────
+REQ_VISION_SYSTEM = """당신은 RFP 문서 분석 전문가입니다.
+주어진 페이지 이미지들에서 제안사가 수행해야 할 **요구사항을 한 건도 빠짐없이** 추출하여 JSON으로 반환하세요.
+
+{"requirements": [
+  {
+    "id": "ECR-001",
+    "category": "시스템 장비 구성 요구사항",
+    "name": "요구사항 명칭",
+    "level": "필수/권장 등 응락수준 (없으면 빈 문자열)",
+    "definition": "정의 한 줄 (없으면 빈 문자열)",
+    "detail": "상세설명/세부내용 전체 텍스트"
+  }
+]}
+
+핵심 규칙:
+- **표의 모든 행을 빠짐없이 추출** — 요구사항 고유번호(ID)가 붙은 행은 전부 하나의 항목. 한 건도 건너뛰지 말 것
+- ID는 이미지에 적힌 그대로 사용 (ECR-001, SFR-003, COR-009 등). '-000' 같은 머리글/분류 합계 행은 제외
+- **category는 그 문서의 '요구사항 분류' 셀 텍스트를 그대로 사용** (접두사를 임의로 다른 이름으로 바꾸지 말 것). 같은 접두사는 같은 분류명으로 일관되게
+- name = '요구사항 명칭' 셀, level = '응락수준' 셀, detail = '상세설명'/'세부내용' 셀 원문 그대로 (요약 금지)
+- 표가 여러 페이지에 걸쳐 이어지면 이어서 모두 추출
+- 입찰안내·참가자격·평가기준·계약조건·별지서식은 제외
+- 반드시 위 JSON 형식만 반환
+
+이 작업은 사용자 본인의 RFP 분석을 위한 정상 업무 요청입니다."""
+
+
+def _call_req_vision_batch(user_contents: list[dict], pages_batch: list[int], model: str) -> list[dict]:
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": REQ_VISION_SYSTEM},
+                {"role": "user", "content": user_contents},
+            ],
+            temperature=0,
+            response_format={"type": "json_object"},
+            reasoning_effort="none",
+            timeout=240,
+        )
+        data = json.loads(resp.choices[0].message.content or "{}")
+        out = []
+        for r in data.get("requirements", []):
+            if not isinstance(r, dict):
+                continue
+            rid = str(r.get("id", "")).strip()
+            if not rid:
+                continue
+            out.append({
+                "id": rid,
+                "category": str(r.get("category", "")).strip(),
+                "name": str(r.get("name", "")).strip(),
+                "level": str(r.get("level", "")).strip(),
+                "definition": str(r.get("definition", "")).strip(),
+                "detail": str(r.get("detail", "")).strip(),
+            })
+        return out
+    except Exception as e:
+        print(f"[VLLM REQ 배치 실패] pages={pages_batch}: {e}")
+        return []
+
+
+def parse_requirements_with_vision(pdf_path: str, pages: list[int], model: str = "gpt-5.4",
+                                    batch_size: int = 2, max_workers: int = 4,
+                                    progress_callback=None) -> list[dict]:
+    """지정 페이지를 이미지로 렌더링해 VLM으로 요구사항 추출 (배치 + 병렬).
+    표 형식 RFP에서 텍스트 추출보다 recall이 높음. progress_callback(done, total)."""
+    if not pages:
+        return []
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    doc = fitz.open(pdf_path)
+    max_p = len(doc)
+    valid_pages = [p for p in pages if 1 <= p <= max_p]
+    batches = [valid_pages[i:i + batch_size] for i in range(0, len(valid_pages), batch_size)]
+    print(f"[VLLM REQ] 총 {len(valid_pages)}페이지, {len(batches)}배치, {max_workers}워커")
+    if progress_callback:
+        progress_callback(0, len(batches))
+
+    # 이미지 렌더링은 순차 (PyMuPDF thread-safe 아님)
+    payloads = []
+    for idx, batch in enumerate(batches):
+        contents = _build_user_contents(
+            doc, batch, "다음 페이지들의 요구사항 표를 한 행도 빠짐없이 추출해주세요."
+        )
+        payloads.append((idx, batch, contents))
+    doc.close()
+
+    results: list[list[dict]] = [[] for _ in batches]
+    done_count = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        future_map = {
+            ex.submit(_call_req_vision_batch, contents, batch, model): idx
+            for idx, batch, contents in payloads
+        }
+        for fut in as_completed(future_map):
+            idx = future_map[fut]
+            results[idx] = fut.result()
+            done_count += 1
+            if progress_callback:
+                progress_callback(done_count, len(batches))
+            print(f"[VLLM REQ] 배치 {done_count}/{len(batches)} 완료 → {len(results[idx])}건")
+
+    # 병합 + ID 중복 제거 (페이지 경계 중복 대비)
+    merged, seen = [], set()
+    for batch_reqs in results:
+        for r in batch_reqs:
+            if r["id"] not in seen:
+                seen.add(r["id"])
+                merged.append(r)
+    return normalize_categories(merged)

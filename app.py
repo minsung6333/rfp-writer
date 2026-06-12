@@ -119,7 +119,14 @@ with st.sidebar:
 
     with tab_pdf:
         uploaded = st.file_uploader("PDF 파일", type=["pdf"], label_visibility="collapsed")
+        req_pages_str = st.text_input(
+            "요구사항 페이지 (VLM 정밀 추출)",
+            placeholder="예: 15-59  (비우면 텍스트 자동 추출)",
+            help="요구사항 표가 있는 페이지를 지정하면 VLM(비전)이 표를 직접 읽어 한 행도 빠짐없이 추출합니다. "
+                 "표 형식 RFP에서 텍스트 추출보다 정확합니다. 비우면 기존 텍스트 자동 추출 방식을 씁니다.",
+        )
         if uploaded and st.button("파싱 시작", use_container_width=True, type="primary"):
+            use_vlm_reqs = bool(req_pages_str.strip())
             with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
                 tmp.write(uploaded.read())
                 tmp_path = tmp.name
@@ -128,6 +135,7 @@ with st.sidebar:
                     extract_text_by_page, find_requirement_pages, find_toc_pages,
                     split_req_chunks, parse_chunk, parse_toc_with_llm,
                     generate_toc_from_requirements, extract_project_overview,
+                    parse_requirements_with_vision, parse_page_range,
                 )
                 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -135,32 +143,58 @@ with st.sidebar:
                 pages = extract_text_by_page(tmp_path)
                 st.write(f"✅ {len(pages)}페이지 추출 완료")
 
-                req_text, is_fallback = find_requirement_pages(pages)
                 toc_text = find_toc_pages(pages)
-                chunks = split_req_chunks(req_text)
-
-                st.write(f"🔍 요구사항 파싱 중... (총 {len(chunks)}개 청크, gpt-4o-mini)")
-                progress = st.progress(0)
-                req_status = st.empty()
-
                 all_requirements, seen_ids = [], set()
-                with ThreadPoolExecutor(max_workers=4) as executor:
-                    f_toc = executor.submit(parse_toc_with_llm, toc_text)
-                    futures = {executor.submit(parse_chunk, c): i for i, c in enumerate(chunks)}
-                    done = 0
-                    for future in as_completed(futures):
-                        done += 1
-                        progress.progress(done / len(chunks))
-                        req_status.caption(f"청크 {done}/{len(chunks)} 완료")
-                        for req in future.result():
-                            rid = req.get("id", "")
-                            if rid and rid not in seen_ids:
-                                seen_ids.add(rid)
-                                all_requirements.append(req)
-                    toc = f_toc.result()
+                is_fallback = False
 
-                progress.empty()
-                req_status.empty()
+                if use_vlm_reqs:
+                    # ── VLM 정밀 추출 (페이지 지정) ──
+                    req_pages = parse_page_range(req_pages_str)
+                    st.write(f"🖼️ VLM 요구사항 추출 중... (지정 {len(req_pages)}페이지, gpt-5.4 비전)")
+                    progress = st.progress(0)
+                    req_status = st.empty()
+
+                    def _vlm_prog(done, total):
+                        if total:
+                            progress.progress(done / total)
+                            req_status.caption(f"배치 {done}/{total} 완료")
+
+                    with ThreadPoolExecutor(max_workers=4) as executor:
+                        f_toc = executor.submit(parse_toc_with_llm, toc_text)
+                        all_requirements = parse_requirements_with_vision(
+                            tmp_path, req_pages, model="gpt-5.4", progress_callback=_vlm_prog,
+                        )
+                        toc = f_toc.result()
+                    progress.empty()
+                    req_status.empty()
+                else:
+                    # ── 텍스트 자동 추출 (기존) ──
+                    req_text, is_fallback = find_requirement_pages(pages)
+                    chunks = split_req_chunks(req_text)
+
+                    st.write(f"🔍 요구사항 파싱 중... (총 {len(chunks)}개 청크, gpt-4o-mini)")
+                    progress = st.progress(0)
+                    req_status = st.empty()
+
+                    with ThreadPoolExecutor(max_workers=4) as executor:
+                        f_toc = executor.submit(parse_toc_with_llm, toc_text)
+                        futures = {executor.submit(parse_chunk, c): i for i, c in enumerate(chunks)}
+                        done = 0
+                        for future in as_completed(futures):
+                            done += 1
+                            progress.progress(done / len(chunks))
+                            req_status.caption(f"청크 {done}/{len(chunks)} 완료")
+                            for req in future.result():
+                                rid = req.get("id", "")
+                                if rid and rid not in seen_ids:
+                                    seen_ids.add(rid)
+                                    all_requirements.append(req)
+                        toc = f_toc.result()
+                    from modules.parser import normalize_categories
+                    all_requirements = normalize_categories(all_requirements)
+
+                    progress.empty()
+                    req_status.empty()
 
                 toc_auto = False
                 if not toc and all_requirements:
